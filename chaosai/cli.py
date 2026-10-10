@@ -21,6 +21,7 @@ from .envfile import load_env, mask
 from . import dashboard as dashboard_mod
 from . import analyzer as analyzer_mod
 from . import discovery, planner
+from . import report as report_mod
 from .evidence import Evidence
 from .agent import InjectorAgent
 from .injector import InjectionError
@@ -236,6 +237,32 @@ def plan(top: int = typer.Option(None, "--top", "-n", help="how many experiments
 
 
 # ------------------------------------------------------------------ agent
+def execute_agent(c: config_mod.Config, exps: list[Experiment], acfg, planner_name: str, stamp: str):
+    """Run the injector agent for real (shared by `agent` and `autopilot`), save the run, print the summary."""
+    live = start_live(c, kill_switch())
+    try:
+        run = InjectorAgent(live.orch, live.guard, live.health, acfg, c.experiment.baseline_s,
+                            c.experiment.recovery_timeout_s, log=typer.echo).run(exps, planner=planner_name)
+    except BaseException:
+        errors = live.injector.restore_all()     # last line of defense; never leave a fault behind
+        typer.secho(f"agent interrupted; restore_all errors: {errors or 'none'}", fg=typer.colors.RED, err=True)
+        raise
+    finally:
+        live.stop()
+    out = RESULTS / "agent-runs" / f"{stamp}.json"     # own folder: results/*.json is experiment history
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(run.model_dump_json(indent=2), encoding="utf-8")
+    done = [e for e in run.entries if e.status == "done"]
+    typer.echo(f"\nagent {run.status}: {len(done)} experiment(s) run, "
+               f"{sum(e.aborted for e in done)} auto-aborted, {sum(bool(e.recovered) for e in done)} recovered")
+    if run.stop_reason:
+        typer.secho(f"stop reason: {run.stop_reason}", fg=typer.colors.YELLOW)
+    if run.not_run:
+        typer.echo(f"not run: {', '.join(run.not_run)}")
+    typer.echo(f"saved {out}")
+    return run
+
+
 @app.command()
 def agent(top: int = typer.Option(None, "--top", "-n", help="experiments to plan (default: planner.top)"),
           max_experiments: int = typer.Option(None, "--max", help="cap on experiments actually run (default: agent.max_experiments)"),
@@ -264,27 +291,7 @@ def agent(top: int = typer.Option(None, "--top", "-n", help="experiments to plan
     typer.echo(f"\nThe agent will inject {n_run} fault(s) into containers labeled chaosai.managed=true on this machine.")
     if not yes and not typer.confirm("Continue?"):
         fail("cancelled; nothing injected", 1)
-    live = start_live(c, kill_switch())
-    try:
-        run = InjectorAgent(live.orch, live.guard, live.health, acfg, c.experiment.baseline_s,
-                            c.experiment.recovery_timeout_s, log=typer.echo).run(exps, planner=result.planner)
-    except BaseException:
-        errors = live.injector.restore_all()     # last line of defense; never leave a fault behind
-        typer.secho(f"agent interrupted; restore_all errors: {errors or 'none'}", fg=typer.colors.RED, err=True)
-        raise
-    finally:
-        live.stop()
-    out = RESULTS / "agent-runs" / f"{stamp}.json"     # own folder: results/*.json is experiment history
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(run.model_dump_json(indent=2), encoding="utf-8")
-    done = [e for e in run.entries if e.status == "done"]
-    typer.echo(f"\nagent {run.status}: {len(done)} experiment(s) run, "
-               f"{sum(e.aborted for e in done)} auto-aborted, {sum(bool(e.recovered) for e in done)} recovered")
-    if run.stop_reason:
-        typer.secho(f"stop reason: {run.stop_reason}", fg=typer.colors.YELLOW)
-    if run.not_run:
-        typer.echo(f"not run: {', '.join(run.not_run)}")
-    typer.echo(f"saved {out}")
+    run = execute_agent(c, exps, acfg, result.planner, stamp)
     if run.status == "stopped":
         raise typer.Exit(1)
 
@@ -389,6 +396,78 @@ def analyze(ids: list[str] = typer.Option(None, "--id", "-i", help="experiment i
     out = RESULTS / "analysis.json"
     out.write_text(result.model_dump_json(indent=2), encoding="utf-8")
     typer.echo(f"\nsaved {out}")
+
+
+# ------------------------------------------------------------------ report / autopilot
+def make_report(c: config_mod.Config, scope: list[str] | None, offline: bool, compose: Path):
+    """Analyze the stored experiments, score them, and write results/findings.{json,md,html}."""
+    ev = Evidence(RESULTS)
+    ids = ev.ids() if scope is None else [i for i in scope if i in ev.ids()]
+    if not ids:
+        fail("no stored experiments to report on; run `chaos autopilot` (or `chaos agent`) first", 1)
+    try:
+        analysis = analyzer_mod.analyze(ev, ids, c.analyzer, use_llm=not offline, cache_dir=RESULTS / "llm_cache")
+    except analyzer_mod.AnalyzerError as e:
+        fail(str(e), 1)
+    (RESULTS / "analysis.json").write_text(analysis.model_dump_json(indent=2), encoding="utf-8")
+    rep = report_mod.build(ev, analysis, load_graph(compose), ids)
+    paths = report_mod.write(RESULTS, rep)
+    sc = rep["score"]
+    how = f"LLM agent ({analysis.model})" if analysis.generated_by == "llm" else "deterministic rules"
+    typer.echo(f"\n{len(ids)} experiment(s), analysis by {how}")
+    if analysis.fallback_reason:
+        typer.secho(f"  rule-based fallback because: {analysis.fallback_reason}", fg=typer.colors.YELLOW)
+    if sc["score"] is None:
+        typer.echo("resilience score: not computable (nothing measurable)")
+    else:
+        typer.echo(f"RESILIENCE SCORE {sc['score']:.1f}/100 ({sc['band']})   "
+                   + "  ".join(f"{k.replace('_', ' ')} {v if v is None else format(v, '.0f')}" for k, v in sc["by_component"].items()))
+    for n, w in enumerate(rep["weaknesses"][:5], 1):
+        typer.echo(f"  {n}. [{w['severity'].upper()}] {w['title']}")
+    for kind in ("md", "html", "json"):
+        typer.echo(f"saved {paths[kind]}")
+    return rep
+
+
+@app.command()
+def report(last: int = typer.Option(None, "--last", help="only the most recent N experiments (default: all stored)"),
+           offline: bool = typer.Option(False, help="skip the LLM; use the deterministic rule-based analyzer"),
+           compose: Path = typer.Option(COMPOSE)):
+    """Write the findings report (score, ranked weaknesses, cited fixes) from the stored experiments."""
+    c = cfg()
+    ids = Evidence(RESULTS).ids()
+    make_report(c, ids[-last:] if last else None, offline, compose)
+
+
+@app.command()
+def autopilot(top: int = typer.Option(None, "--top", "-n", help="experiments to plan (default: planner.top)"),
+              max_experiments: int = typer.Option(None, "--max", help="cap on experiments actually run (default: agent.max_experiments)"),
+              offline: bool = typer.Option(False, help="skip the LLM everywhere; heuristic planner + rule-based analyzer"),
+              dry_run: bool = typer.Option(False, help="plan and validate; inject nothing"),
+              yes: bool = typer.Option(False, "--yes", "-y", help="do not ask for confirmation"),
+              compose: Path = typer.Option(COMPOSE)):
+    """Hands-off end to end: plan, inject with the agent, analyze, score, and write the findings report."""
+    if dry_run:
+        return agent(top=top, max_experiments=max_experiments, offline=offline, dry_run=True, yes=True, compose=compose)
+    c = cfg()
+    result, n_history = make_plan(c, top, offline, compose)
+    print_plan(result, n_history)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    exps = [e.model_copy(update={"thresholds": default_thresholds(c)}) for e in planner.to_experiments(result, stamp)]
+    acfg = c.agent.model_copy(update={"max_experiments": max_experiments or c.agent.max_experiments})
+    n_run = min(len(exps), acfg.max_experiments)
+    typer.echo(f"\nAUTOPILOT: the agent will inject {n_run} fault(s) one at a time into containers labeled "
+               f"chaosai.managed=true on this machine, then analyze, score and write the report. Kill switch: Ctrl+C or `chaos abort`.")
+    if not yes and not typer.confirm("Continue?"):
+        fail("cancelled; nothing injected", 1)
+    run = execute_agent(c, exps, acfg, result.planner, stamp)
+    done = [e.id for e in run.entries if e.status == "done"]
+    if not done:
+        fail("the agent ran no experiments, so there is nothing to report", 1)
+    typer.echo("\nanalyzing, scoring and writing the report ...")
+    make_report(c, done, offline, compose)
+    if run.status == "stopped":
+        raise typer.Exit(1)
 
 
 # ------------------------------------------------------------------ baseline

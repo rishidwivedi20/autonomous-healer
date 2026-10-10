@@ -139,6 +139,9 @@ def run_probe(store, url, seconds, **kw):
     for k, v in kw.items():
         setattr(p, k, v)
     p.start()
+    deadline = time.time() + 5.0                      # a loaded machine can take a while to start the first request
+    while not store.query("SELECT 1 FROM probes LIMIT 1") and time.time() < deadline:
+        time.sleep(0.05)
     time.sleep(seconds)
     p.stop()
     return p

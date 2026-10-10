@@ -163,3 +163,91 @@ def test_agent_without_docker_refuses_before_injecting(isolated, monkeypatch):
 def test_agent_asks_for_confirmation_and_cancels_cleanly(isolated):
     r = runner.invoke(cli.app, ["agent", "--offline", "--top", "2"], input="n\n")
     assert r.exit_code == 1 and "Continue?" in r.output and "cancelled; nothing injected" in r.output
+
+
+# ---- report / autopilot
+def _with_results(tmp_path, monkeypatch):
+    from tests.fixtures_results import make_results
+    (tmp_path / "fx").mkdir()
+    d = make_results(tmp_path / "fx")
+    monkeypatch.setattr(cli, "RESULTS", d)
+    return d
+
+
+def test_report_writes_findings_and_prints_the_score(tmp_path, monkeypatch):
+    d = _with_results(tmp_path, monkeypatch)
+    r = runner.invoke(cli.app, ["report", "--offline"])
+    assert r.exit_code == 0, r.output
+    assert "RESILIENCE SCORE" in r.output and "2 experiment(s), analysis by deterministic rules" in r.output
+    for name in ("findings.md", "findings.html", "findings.json", "analysis.json"):
+        assert (d / name).exists(), name
+
+
+def test_report_last_limits_the_scope(tmp_path, monkeypatch):
+    d = _with_results(tmp_path, monkeypatch)
+    r = runner.invoke(cli.app, ["report", "--offline", "--last", "1"])
+    assert r.exit_code == 0 and "1 experiment(s)" in r.output
+
+
+def test_report_with_nothing_stored_is_a_clean_error(isolated):
+    r = runner.invoke(cli.app, ["report", "--offline"])
+    assert r.exit_code == 1 and "no stored experiments" in r.output and not (isolated / "findings.md").exists()
+
+
+def test_autopilot_dry_run_plans_and_injects_nothing(isolated):
+    r = runner.invoke(cli.app, ["autopilot", "--dry-run", "--offline", "--top", "2"])
+    assert r.exit_code == 0, r.output
+    assert "DRY RUN: the agent would inject 2 fault(s)" in r.output
+    assert not (isolated / "agent-runs").exists() and not (isolated / "findings.md").exists()
+
+
+def test_autopilot_asks_for_confirmation_and_cancels_cleanly(isolated):
+    r = runner.invoke(cli.app, ["autopilot", "--offline", "--top", "2"], input="n\n")
+    assert r.exit_code == 1 and "AUTOPILOT" in r.output and "cancelled; nothing injected" in r.output
+
+
+def _fake_agent(monkeypatch, entries, status="completed", seen=None):
+    from chaosai.agent import AgentEntry, AgentRun
+
+    def fake(c, exps, acfg, planner_name, stamp):
+        if seen is not None:
+            seen.append(([e.id for e in exps], planner_name))
+        return AgentRun(started_at=1.0, ended_at=2.0, status=status, stop_reason="boom" if status == "stopped" else None,
+                        entries=[AgentEntry(id=i, target="x", fault="y", status=s) for i, s in entries])
+    monkeypatch.setattr(cli, "execute_agent", fake)
+
+
+def test_autopilot_chains_agent_then_report_with_no_manual_step(tmp_path, monkeypatch):
+    from tests.fixtures_results import KILL_ID, SPIKE_ID
+    d = _with_results(tmp_path, monkeypatch)
+    seen = []
+    _fake_agent(monkeypatch, [(SPIKE_ID, "done"), (KILL_ID, "done")], seen=seen)
+    r = runner.invoke(cli.app, ["autopilot", "--offline", "--yes", "--top", "2"])
+    assert r.exit_code == 0, r.output
+    assert len(seen) == 1 and len(seen[0][0]) == 2 and seen[0][1] == "heuristic"          # it planned and handed the plan to the agent
+    assert "analyzing, scoring and writing the report" in r.output and "RESILIENCE SCORE" in r.output
+    assert (d / "findings.md").exists() and (d / "findings.html").exists()
+
+
+def test_autopilot_reports_only_what_the_agent_actually_ran(tmp_path, monkeypatch):
+    from tests.fixtures_results import KILL_ID, SPIKE_ID
+    d = _with_results(tmp_path, monkeypatch)
+    _fake_agent(monkeypatch, [(SPIKE_ID, "done"), (KILL_ID, "skipped")])
+    r = runner.invoke(cli.app, ["autopilot", "--offline", "--yes", "--top", "2"])
+    assert r.exit_code == 0 and "1 experiment(s)" in r.output
+    assert [e["id"] for e in json.loads((d / "findings.json").read_text(encoding="utf-8"))["experiments"]] == [SPIKE_ID]
+
+
+def test_autopilot_still_reports_when_the_agent_stopped_early_but_exits_non_zero(tmp_path, monkeypatch):
+    from tests.fixtures_results import SPIKE_ID
+    d = _with_results(tmp_path, monkeypatch)
+    _fake_agent(monkeypatch, [(SPIKE_ID, "done")], status="stopped")
+    r = runner.invoke(cli.app, ["autopilot", "--offline", "--yes", "--top", "2"])
+    assert r.exit_code == 1 and (d / "findings.md").exists()
+
+
+def test_autopilot_with_no_completed_experiment_does_not_write_a_report(tmp_path, monkeypatch):
+    d = _with_results(tmp_path, monkeypatch)
+    _fake_agent(monkeypatch, [("e1", "skipped")], status="stopped")
+    r = runner.invoke(cli.app, ["autopilot", "--offline", "--yes", "--top", "2"])
+    assert r.exit_code == 1 and "nothing to report" in r.output and not (d / "findings.md").exists()

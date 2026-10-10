@@ -93,6 +93,12 @@ class Evidence:
     def ids(self) -> list[str]:
         return list(self._exps)
 
+    def results(self) -> dict[str, ExperimentResult]:
+        return dict(self._exps)
+
+    def restarts_of(self, exp_id: str) -> dict:
+        return self._restarts(self._exps[exp_id])
+
     def _need(self, exp_id: str) -> ExperimentResult | dict:
         r = self._exps.get(exp_id)
         return r if r else {"error": f"unknown experiment_id {exp_id!r}", "known_ids": self.ids()}
