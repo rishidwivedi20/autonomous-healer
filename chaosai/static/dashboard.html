@@ -8,13 +8,13 @@
   :root {
     --bg: #f6f7f9; --card: #ffffff; --ink: #14181f; --muted: #5d6675; --line: #dfe3ea; --grid: #e9ecf1;
     --vote: #2563eb; --result: #15803d; --queue: #c2570c; --votes: #7c3aed; --bad: #dc2626; --warn: #d97706; --ok: #15803d;
-    --shade: rgba(220, 38, 38, .11);
+    --shade: rgba(220, 38, 38, .11); --crit: #db2777;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #0f1218; --card: #171b23; --ink: #e8ebf1; --muted: #98a1b0; --line: #2a303b; --grid: #232933;
       --vote: #60a5fa; --result: #4ade80; --queue: #fb923c; --votes: #a78bfa; --bad: #f87171; --warn: #fbbf24; --ok: #4ade80;
-      --shade: rgba(248, 113, 113, .14);
+      --shade: rgba(248, 113, 113, .14); --crit: #f472b6;
     }
   }
   * { box-sizing: border-box; }
@@ -60,6 +60,32 @@
   #log div b { display: inline-block; min-width: 64px; color: var(--muted); font-weight: 500; }
   .bottom { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 12px; }
   .note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  /* dependency graph */
+  #graph { width: 100%; height: auto; display: block; }
+  .gedge { fill: none; stroke: var(--muted); stroke-width: 2; }
+  .gedge.hot { stroke: var(--bad); stroke-width: 3; }
+  .gnode .body { fill: var(--card); stroke-width: 2.5; }
+  .gnode.h-ok .body { stroke: var(--ok); }
+  .gnode.h-warn .body { stroke: var(--warn); }
+  .gnode.h-down .body { stroke: var(--bad); fill: color-mix(in srgb, var(--bad) 14%, var(--card)); }
+  .gnode.h-plain .body { stroke: var(--vote); }
+  .gnode.h-unknown .body { stroke: var(--muted); }
+  .gnode .ring { fill: none; stroke: transparent; stroke-width: 2; }
+  .gnode.crit .ring { stroke: var(--crit); stroke-dasharray: 5 4; opacity: .85; }
+  .gnode.fault .ring { stroke: var(--bad); stroke-width: 3.5; stroke-dasharray: none; opacity: 1; animation: pulse 1s infinite; }
+  .gnode.recovering .ring { stroke: var(--warn); stroke-width: 3.5; stroke-dasharray: none; opacity: 1; animation: pulse 1s infinite; }
+  .gnode.risk .ring { stroke: var(--warn); stroke-width: 3.5; stroke-dasharray: none; opacity: 1; }
+  .gnode text { fill: var(--ink); font: 12px system-ui, sans-serif; }
+  .gnode .nm { font-weight: 700; font-size: 15px; }
+  .gnode .sub { fill: var(--muted); font-size: 11px; }
+  .gnode .wrn { fill: var(--warn); font-size: 11px; font-weight: 600; }
+  .badge rect { fill: var(--card); stroke-width: 1.5; }
+  .badge text { font-size: 11px; font-weight: 700; }
+  .badge.b-fault rect { fill: var(--bad); stroke: var(--bad); } .badge.b-fault text { fill: #fff; }
+  .badge.b-warn rect { fill: var(--warn); stroke: var(--warn); } .badge.b-warn text { fill: #111; }
+  .badge.b-dim rect { stroke: var(--muted); } .badge.b-dim text { fill: var(--muted); }
+  .legend { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin: 0 4px 0 12px; vertical-align: -1px; }
   @media (max-width: 520px) { .grid { grid-template-columns: 1fr; } header { padding: 12px 14px; } main { padding: 12px 14px 32px; } }
 </style>
 </head>
@@ -83,6 +109,13 @@
 <main>
   <div id="banner"></div>
   <div class="cards" id="cards"></div>
+  <div class="panel" style="margin-bottom:14px">
+    <h2>Dependency graph &middot; live health and blast radius</h2>
+    <svg id="graph" viewBox="0 0 900 240" role="img" aria-label="service dependency graph"></svg>
+    <div class="legend">Arrow A &rarr; B: A depends on B. Dashed pink ring: user critical path.
+      Border: <i style="background:var(--ok)"></i>healthy <i style="background:var(--warn)"></i>starting / at risk <i style="background:var(--bad)"></i>down or faulted <i style="background:var(--vote)"></i>running, no healthcheck.
+      While a fault runs, the faulted service pulses red and everything that depends on it turns amber; after it, services that really restarted keep a badge.</div>
+  </div>
   <div class="grid">
     <div class="panel"><h2>Latency p95 (ms) &middot; successful requests</h2><canvas id="c_lat"></canvas></div>
     <div class="panel"><h2>Error rate (%) &middot; failed requests</h2><canvas id="c_err"></canvas></div>
@@ -98,10 +131,22 @@
   </div>
   <p class="note">Everything here is read from the live SQLite store: a synthetic user posts a vote and loads the result page <span id="rate">5</span>&times; per second. The red band is the time the fault was active; red lines mark container restarts. Latency percentiles cover successful requests only; a failed request counts toward the error rate.</p>
 </main>
+<script src="/graph.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
-let data = null, prevRestarts = {}, toastTimer = null;
+let data = null, prevRestarts = {}, toastTimer = null, GRAPH = null;
+async function loadGraph() {
+  try { const r = await fetch('/api/graph'); if (!r.ok) throw new Error(r.status); GRAPH = await r.json(); if (data) drawGraph(data); }
+  catch (e) { setTimeout(loadGraph, 5000); }
+}
+function recentErrors(arr) { const a = arr.slice(-4).filter(v => v != null); return a.length > 0 && a.reduce((x, y) => x + y, 0) > 0; }
+function drawGraph(d) {
+  if (!GRAPH || !window.ChaosGraph) return;
+  ChaosGraph.renderGraph($('#graph'), GRAPH, { containers: d.containers, experiment: d.experiment,
+    errors: { vote: recentErrors(d.series.vote.err), result: recentErrors(d.series.result.err) } });
+}
+loadGraph();
 
 // ---------------------------------------------------------------- charts
 function chart(canvas, o) {
@@ -155,6 +200,7 @@ function lastVal(arr, k = 4) { const a = arr.slice(-k).filter(v => v != null); r
 function maxVal(arr, k) { const a = arr.slice(-k).filter(v => v != null); return a.length ? Math.max(...a) : null; }
 
 function render(d) {
+  drawGraph(d);
   const S = d.series, t0 = d.now - d.window_s, t1 = d.now, ex = d.experiment, ts = S.t;
   const fault = { start: ex.fault_start, end: ex.fault_end };
   const restarts = d.events.filter(e => e.kind === 'restart_count' && !e.initial).map(e => ({ t: e.t, service: e.service }));

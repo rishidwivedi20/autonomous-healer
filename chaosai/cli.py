@@ -302,7 +302,10 @@ def dashboard(port: int = typer.Option(None, help="default: dashboard.port"),
     live = start_live(c, kill, interval_s=1.0 / c.dashboard.probe_rate_per_s, gauge_every_s=1.0, install_signals=False)
     table = dashboard_mod.ContainerTable(live.watcher.table)
     table.start()
-    web = dashboard_mod.App(c, live.store, live.injector, kill, live.orch, lambda: table.data)
+    graph_obj, graph_notes = discovery.discover(COMPOSE, COMPOSE.parent / "graph.overrides.yaml")
+    discovery.write_graph(graph_obj, RESULTS / "graph.json", graph_notes)     # keep results/graph.json in step with what is drawn
+    graph_dump = graph_obj.model_dump()
+    web = dashboard_mod.App(c, live.store, live.injector, kill, live.orch, lambda: table.data, graph_fn=lambda: graph_dump)
     try:
         server = dashboard_mod.make_server(web, port)
     except OSError as e:

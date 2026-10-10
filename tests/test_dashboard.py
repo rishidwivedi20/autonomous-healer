@@ -93,12 +93,12 @@ def wait_for(cond, secs=3):
     return False
 
 
-def make_app(tmp_path, orch=None):
+def make_app(tmp_path, orch=None, graph_fn=None):
     cfg = config.load(Path("none.yaml"))
     kill = KillSwitch(tmp_path / "KILL")
     orch = orch or FakeOrch()
     app = App(cfg, Store(tmp_path / "t.db"), orch.injector, kill, orch,
-              lambda: {"redis": {"state": "running", "health": "healthy", "restarts": 0}})
+              lambda: {"redis": {"state": "running", "health": "healthy", "restarts": 0}}, graph_fn=graph_fn)
     return app, orch, kill
 
 
@@ -270,3 +270,67 @@ def test_watcher_start_snapshot_is_flagged_initial_but_real_changes_are_not(tmp_
     assert got[("restart_count", "2", 60)] is True
     assert got[("state", "running", 60)] is True
     assert got[("restart_count", "3", 30)] is False
+
+
+# ---------------------------------------------------------------- the dependency-graph panel
+GRAPH = {"critical_path": ["vote", "redis"], "services": {
+    "vote": {"name": "vote", "replicas": 1, "healthcheck": True, "depends_on": ["redis"], "on_critical_path": True},
+    "redis": {"name": "redis", "replicas": 1, "healthcheck": True, "depends_on": [], "on_critical_path": True}}}
+
+
+def serve(tmp_path, graph_fn):
+    app, orch, kill = make_app(tmp_path, graph_fn=graph_fn)
+    server = make_server(app, 0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, orch
+
+
+def stop(server):
+    server.shutdown()
+    server.server_close()
+
+
+def test_graph_endpoint_serves_the_dependency_map(tmp_path):
+    server, orch = serve(tmp_path, lambda: GRAPH)
+    try:
+        status, body = call(server.server_port, "GET", "/api/graph")
+        assert status == 200 and body["critical_path"] == ["vote", "redis"] and body["services"]["vote"]["depends_on"] == ["redis"]
+    finally:
+        stop(server)
+
+
+def test_graph_endpoint_reports_an_unavailable_graph_without_crashing(tmp_path):
+    server, orch = serve(tmp_path, None)
+    try:
+        status, body = call(server.server_port, "GET", "/api/graph")
+        assert status == 503 and "chaos discover" in body["error"]
+    finally:
+        stop(server)
+
+
+def test_graph_endpoint_reports_a_failing_source_without_crashing(tmp_path):
+    def boom():
+        raise RuntimeError("graph.json is corrupt")
+    server, orch = serve(tmp_path, boom)
+    try:
+        status, body = call(server.server_port, "GET", "/api/graph")
+        assert status == 503 and "graph.json is corrupt" in body["error"]
+    finally:
+        stop(server)
+
+
+def test_graph_script_and_page_are_served_and_the_page_wires_them_together(web):
+    status, html = call(web.port, "GET", "/")
+    assert status == 200 and 'id="graph"' in html and "Dependency graph" in html and 'src="/graph.js"' in html
+    assert "/api/graph" in html and "ChaosGraph.renderGraph" in html
+    c = http.client.HTTPConnection("127.0.0.1", web.port, timeout=5)
+    c.request("GET", "/graph.js")
+    r = c.getresponse()
+    body = r.read().decode()
+    assert r.status == 200 and r.getheader("Content-Type").startswith("application/javascript")
+    assert "buildSvg" in body and "blastRadius" in body
+
+
+def test_graph_routes_enforce_the_same_host_check(web):
+    assert call(web.port, "GET", "/api/graph", host="evil.example")[0] == 403
+    assert call(web.port, "GET", "/graph.js", host="evil.example")[0] == 403

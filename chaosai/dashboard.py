@@ -31,6 +31,7 @@ from .observer import Store, events as query_events, gauge_series, percentile
 from .safety import SafetyViolation
 
 STATIC = Path(__file__).parent / "static" / "dashboard.html"
+GRAPH_JS = Path(__file__).parent / "static" / "graph.js"
 JOURNEYS = ("vote", "result")
 GAUGES = ("redis_queue_len", "db_votes")
 
@@ -163,10 +164,20 @@ class ContainerTable(threading.Thread):
 
 
 class App:
-    def __init__(self, cfg: Config, store: Store, injector, kill, orch, containers_fn):
+    def __init__(self, cfg: Config, store: Store, injector, kill, orch, containers_fn, graph_fn=None):
         self.cfg, self.store, self.injector, self.kill = cfg, store, injector, kill
         self.runner = Runner(orch, cfg)
         self.containers_fn = containers_fn
+        self.graph_fn = graph_fn
+
+    def graph(self) -> tuple[int, dict]:
+        """The dependency map (same data as results/graph.json) for the graph panel."""
+        if self.graph_fn is None:
+            return 503, {"error": "no dependency graph is available (run `chaos discover`)"}
+        try:
+            return 200, self.graph_fn()
+        except Exception as e:
+            return 503, {"error": f"could not load the dependency graph: {e}"}
 
     # ---- reads
     def _events(self, start: float, end: float) -> list[dict]:
@@ -268,8 +279,12 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/":
             return self._send(200, STATIC.read_bytes(), "text/html; charset=utf-8")
+        if path == "/graph.js":
+            return self._send(200, GRAPH_JS.read_bytes(), "application/javascript; charset=utf-8")
         if path == "/api/metrics":
             return self._json(200, self.server.app.metrics())
+        if path == "/api/graph":
+            return self._json(*self.server.app.graph())
         self._json(404, {"error": "not found"})
 
     def do_POST(self):
