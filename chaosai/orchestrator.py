@@ -36,21 +36,21 @@ INSTANT_FAULTS = {"kill"}
 GAUGES = ("redis_queue_len", "db_votes")
 
 
-def is_recovered(s: Stats, baseline: Stats, tol: float = TOLERANCE) -> bool:
+def is_recovered(s: Stats, baseline: Stats, tol: float = TOLERANCE, slack_ms: float = LATENCY_SLACK_MS) -> bool:
     if not s.n or s.error_rate is None or s.p95_ms is None:     # no data, or every request failed
         return False
     if s.error_rate > (baseline.error_rate or 0.0) * (1 + tol):
         return False
     base_p95 = baseline.p95_ms or 0.0
-    return s.p95_ms <= base_p95 * (1 + tol) + LATENCY_SLACK_MS
+    return s.p95_ms <= base_p95 * (1 + tol) + slack_ms
 
 
 def find_recovery(store: Store, start: float, now: float, baseline: Stats,
-                  hold: int = HOLD_S, tol: float = TOLERANCE) -> float | None:
+                  hold: int = HOLD_S, tol: float = TOLERANCE, slack_ms: float = LATENCY_SLACK_MS) -> float | None:
     """Earliest offset (seconds from `start`) from which `hold` consecutive seconds are within
     tolerance of baseline, or None if that has not happened yet."""
     for i in range(int(now - start) - hold + 1):
-        if is_recovered(worst_window(store, start + i, start + i + hold), baseline, tol):
+        if is_recovered(worst_window(store, start + i, start + i + hold), baseline, tol, slack_ms):
             return float(i)
     return None
 
@@ -59,8 +59,10 @@ class Orchestrator:
     def __init__(self, store: Store, injector, guard: Guard, results_dir: Path | str,
                  health_fn: Callable[[], list[str]] = lambda: [],
                  clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep,
-                 tick_s: float = 1.0, settle_s: float = 0.0):
-        self.settle_s = settle_s
+                 tick_s: float = 1.0, settle_s: float = 0.0, hold_s: int = HOLD_S, tolerance: float = TOLERANCE,
+                 slack_ms: float = LATENCY_SLACK_MS, preflight_max_error_rate: float = 0.05):
+        self.settle_s, self.hold_s, self.tolerance, self.slack_ms = settle_s, hold_s, tolerance, slack_ms
+        self.preflight_max_error_rate = preflight_max_error_rate
         self.store, self.injector, self.guard = store, injector, guard
         self.results_dir = Path(results_dir)
         self.health_fn, self.clock, self.sleep, self.tick_s = health_fn, clock, sleep, tick_s
@@ -93,7 +95,7 @@ class Orchestrator:
         baseline = window(self.store, t_start, t_base_end)
         # steady state and recovery are judged on the worst journey; reported baseline stays overall
         baseline_worst = worst_window(self.store, t_start, t_base_end)
-        self.guard.preflight(baseline_worst, self.health_fn())
+        self.guard.preflight(baseline_worst, self.health_fn(), self.preflight_max_error_rate)
 
         # ---- inject + monitor; rollback in finally, whatever happens
         self.guard.begin()
@@ -123,7 +125,8 @@ class Orchestrator:
         recovery = None
         while True:
             now = self.clock()
-            recovery = find_recovery(self.store, t_fault_end, now - self.settle_s, baseline_worst)
+            recovery = find_recovery(self.store, t_fault_end, now - self.settle_s, baseline_worst,
+                                     self.hold_s, self.tolerance, self.slack_ms)
             if recovery is not None or now - t_fault_end >= recovery_timeout_s or self.guard.kill.engaged:
                 break
             self.sleep(self.tick_s)

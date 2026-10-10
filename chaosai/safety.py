@@ -53,7 +53,8 @@ class KillSwitch:
 
 
 class Guard:
-    def __init__(self, managed_targets: set[str], kill: KillSwitch):
+    def __init__(self, managed_targets: set[str], kill: KillSwitch, max_duration_s: int = MAX_DURATION_S):
+        self.max_duration_s = max(1, min(max_duration_s, MAX_DURATION_S))   # config may only tighten the hard cap
         self.managed_targets = managed_targets   # service names whose container has the label
         self.kill = kill
         self._running = False
@@ -75,7 +76,7 @@ class Guard:
             breach_seconds=max(1, min(t.breach_seconds, MAX_THRESHOLDS.breach_seconds)),
         )
         return exp.model_copy(update={
-            "duration_s": min(exp.duration_s, MAX_DURATION_S),
+            "duration_s": min(exp.duration_s, self.max_duration_s),
             "thresholds": clamped,
         })
 

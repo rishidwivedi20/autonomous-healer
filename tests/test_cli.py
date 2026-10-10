@@ -135,3 +135,31 @@ def test_plan_counts_past_experiments(isolated):
     r = runner.invoke(cli.app, ["plan", "--offline", "--dry-run"])
     assert "1 past experiment(s) considered" in r.output
     assert "1. db / kill" not in r.output          # already tested once, loses its untested bonus
+
+
+# ---- agent
+def test_agent_dry_run_plans_validates_and_injects_nothing(isolated):
+    r = runner.invoke(cli.app, ["agent", "--dry-run", "--offline", "--top", "3"])
+    assert r.exit_code == 0, r.output
+    assert "DRY RUN: the agent would inject 3 fault(s)" in r.output
+    assert r.output.count("[dry-run] would apply") == 3
+    assert list(isolated.glob("*.json")) == [] or all(p.name == "graph.json" for p in isolated.glob("*.json"))
+    assert not (isolated / "agent-runs").exists() and not (isolated / "KILL").exists()
+
+
+def test_agent_max_flag_caps_the_run(isolated):
+    r = runner.invoke(cli.app, ["agent", "--dry-run", "--offline", "--top", "4", "--max", "2"])
+    assert "would inject 2 fault(s)" in r.output and r.output.count("[dry-run] would apply") == 2
+
+
+def test_agent_without_docker_refuses_before_injecting(isolated, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("no docker")
+    monkeypatch.setattr(cli, "make_injector", boom)
+    r = runner.invoke(cli.app, ["agent", "--offline", "--yes", "--top", "2"])
+    assert r.exit_code == 2 and "cannot reach Docker" in r.output and not (isolated / "chaosai.db").exists()
+
+
+def test_agent_asks_for_confirmation_and_cancels_cleanly(isolated):
+    r = runner.invoke(cli.app, ["agent", "--offline", "--top", "2"], input="n\n")
+    assert r.exit_code == 1 and "Continue?" in r.output and "cancelled; nothing injected" in r.output

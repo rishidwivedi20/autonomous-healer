@@ -25,6 +25,8 @@ from pydantic import BaseModel, Field, ValidationError
 
 from .models import Experiment, ExperimentResult, Graph, Plan, PlannedExperiment, Service
 
+from .config import DEFAULT_FAULTS, PlannerCfg
+
 MODEL = "claude-opus-5-5"
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
@@ -32,16 +34,6 @@ FAULT_WEIGHT = {
     "kill": 1.0, "stop": 0.8, "pause": 0.8, "network-delay": 0.7, "network-loss": 0.7,
     "memory-limit": 0.6, "traffic-spike": 0.6, "cpu-limit": 0.5,
 }
-DEFAULT_PARAMS = {
-    "kill": {}, "stop": {}, "pause": {},
-    "network-delay": {"latency_ms": 500},
-    "network-loss": {"loss_pct": 30},
-    "cpu-limit": {"cpus": 0.1},
-    "memory-limit": {"mem": "32m"},
-    "traffic-spike": {"multiplier": 5},
-}
-DEFAULT_DURATION = {"kill": 30, "stop": 30, "pause": 20, "network-delay": 30, "network-loss": 30,
-                    "cpu-limit": 30, "memory-limit": 30, "traffic-spike": 30}
 MAX_PER_TARGET = 2
 MAX_PER_FAULT = 3
 
@@ -145,7 +137,8 @@ def _hypothesis(fault: str, svc: Service, graph: Graph) -> str:
     }[fault]
 
 
-def candidates(graph: Graph, history: list[dict] | None = None) -> list[Candidate]:
+def candidates(graph: Graph, history: list[dict] | None = None, faults: dict | None = None) -> list[Candidate]:
+    faults = faults or DEFAULT_FAULTS            # per-fault duration/params (config.yaml `faults`)
     tested: dict[tuple[str, str], int] = {}
     for h in history or []:
         tested[(h["target"], h["fault"])] = tested.get((h["target"], h["fault"]), 0) + 1
@@ -156,8 +149,8 @@ def candidates(graph: Graph, history: list[dict] | None = None) -> list[Candidat
             n = tested.get((svc.name, fault), 0)
             bonus, w = untested_bonus(n), FAULT_WEIGHT[fault]
             out.append(Candidate(
-                id=0, target=svc.name, fault=fault, params=dict(DEFAULT_PARAMS[fault]),
-                duration_s=DEFAULT_DURATION[fault], score=round(crit * frag * bonus * w, 3),
+                id=0, target=svc.name, fault=fault, params=dict(faults[fault].params),
+                duration_s=faults[fault].duration_s, score=round(crit * frag * bonus * w, 3),
                 factors={"criticality": crit, "fragility": frag, "untested": bonus, "fault_weight": w},
                 reason=("; ".join(_facts(svc, graph)) or "no notable risk factors")
                        + ("; never tested" if n == 0 else f"; tested {n}x before"),
@@ -168,7 +161,8 @@ def candidates(graph: Graph, history: list[dict] | None = None) -> list[Candidat
     return out
 
 
-def select(cands: list[Candidate], n: int) -> list[Candidate]:
+def select(cands: list[Candidate], n: int, max_per_target: int = MAX_PER_TARGET,
+           max_per_fault: int = MAX_PER_FAULT) -> list[Candidate]:
     """Greedy by score with variety caps, so the plan is not six variations of one failure."""
     chosen: list[Candidate] = []
     per_target: dict[str, int] = {}
@@ -176,7 +170,7 @@ def select(cands: list[Candidate], n: int) -> list[Candidate]:
     for c in cands:
         if len(chosen) >= n:
             break
-        if per_target.get(c.target, 0) >= MAX_PER_TARGET or per_fault.get(c.fault, 0) >= MAX_PER_FAULT:
+        if per_target.get(c.target, 0) >= max_per_target or per_fault.get(c.fault, 0) >= max_per_fault:
             continue
         chosen.append(c)
         per_target[c.target] = per_target.get(c.target, 0) + 1
@@ -192,8 +186,10 @@ def _planned(rank: int, c: Candidate, duration_s: int | None = None, hypothesis:
 
 
 def heuristic_plan(graph: Graph, history: list[dict] | None = None, n: int = 6,
-                   fallback_reason: str | None = None) -> Plan:
-    chosen = select(candidates(graph, history), n)
+                   fallback_reason: str | None = None, cfg: PlannerCfg | None = None,
+                   faults: dict | None = None) -> Plan:
+    cfg = cfg or PlannerCfg()
+    chosen = select(candidates(graph, history, faults), n, cfg.max_per_target, cfg.max_per_fault)
     return Plan(planner="heuristic", created_at=time.time(), fallback_reason=fallback_reason,
                 experiments=[_planned(i + 1, c) for i, c in enumerate(chosen)])
 
@@ -257,11 +253,11 @@ def _cache_path(cache_dir: Path, model: str, system: str, user: str) -> Path:
     return Path(cache_dir) / f"plan-{key}.json"
 
 
-def _call_model(client, user: str) -> str:
+def _call_model(client, user: str, model: str = MODEL, effort: str = "medium") -> str:
     resp = client.beta.messages.create(
-        model=MODEL, max_tokens=8000, system=SYSTEM,
+        model=model, max_tokens=8000, system=SYSTEM,
         betas=[FALLBACK_BETA], fallbacks="default",            # re-run on the fallback model if declined
-        output_config={"effort": "medium", "format": {"type": "json_schema", "schema": LLM_SCHEMA}},
+        output_config={"effort": effort, "format": {"type": "json_schema", "schema": LLM_SCHEMA}},
         messages=[{"role": "user", "content": user}])
     if resp.stop_reason == "refusal":                         # branch on stop_reason before reading content
         raise PlannerError("model refused the request")
@@ -300,12 +296,13 @@ def _validate(text: str, cands: list[Candidate], n: int) -> list[PlannedExperime
 
 
 def llm_plan(graph: Graph, history: list[dict], n: int = 6, client=None, cache_dir: Path | None = None,
-             pool: int = 14) -> Plan:
+             cfg: PlannerCfg | None = None, faults: dict | None = None) -> Plan:
     """Raises PlannerError on any problem; make_plan() turns that into a heuristic fallback."""
-    cands = candidates(graph, history)[:pool]
+    cfg = cfg or PlannerCfg()
+    cands = candidates(graph, history, faults)[:cfg.llm_pool]
     user = _prompt(graph, cands, history, n)
     notes = []
-    cache = _cache_path(cache_dir, MODEL, SYSTEM, user) if cache_dir else None
+    cache = _cache_path(cache_dir, f"{cfg.llm_model}|{cfg.llm_effort}", SYSTEM, user) if cache_dir else None
     text = None
     if cache and cache.exists():
         text = json.loads(cache.read_text(encoding="utf-8"))["text"]
@@ -315,7 +312,7 @@ def llm_plan(graph: Graph, history: list[dict], n: int = 6, client=None, cache_d
             if client is None:
                 import anthropic
                 client = anthropic.Anthropic()
-            text = _call_model(client, user)
+            text = _call_model(client, user, cfg.llm_model, cfg.llm_effort)
         experiments = _validate(text, cands, n)
     except PlannerError:
         raise
@@ -325,18 +322,19 @@ def llm_plan(graph: Graph, history: list[dict], n: int = 6, client=None, cache_d
         raise PlannerError(f"{type(e).__name__}: {str(e)[:200]}") from e
     if cache and not cache.exists():                          # only validated responses are cached
         cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(json.dumps({"model": MODEL, "text": text}), encoding="utf-8")
-    return Plan(planner="llm", model=MODEL, created_at=time.time(), notes=notes, experiments=experiments)
+        cache.write_text(json.dumps({"model": cfg.llm_model, "text": text}), encoding="utf-8")
+    return Plan(planner="llm", model=cfg.llm_model, created_at=time.time(), notes=notes, experiments=experiments)
 
 
 def make_plan(graph: Graph, history: list[dict], n: int = 6, use_llm: bool = True, client=None,
-              cache_dir: Path | None = None) -> Plan:
+              cache_dir: Path | None = None, cfg: PlannerCfg | None = None, faults: dict | None = None) -> Plan:
     if not use_llm:
-        return heuristic_plan(graph, history, n, fallback_reason="LLM disabled (--offline)")
+        return heuristic_plan(graph, history, n, fallback_reason="LLM disabled (--offline or planner.use_llm: false)",
+                              cfg=cfg, faults=faults)
     try:
-        return llm_plan(graph, history, n, client, cache_dir)
+        return llm_plan(graph, history, n, client, cache_dir, cfg, faults)
     except PlannerError as e:
-        return heuristic_plan(graph, history, n, fallback_reason=str(e))
+        return heuristic_plan(graph, history, n, fallback_reason=str(e), cfg=cfg, faults=faults)
 
 
 def to_experiments(plan: Plan, stamp: str | None = None) -> list[Experiment]:

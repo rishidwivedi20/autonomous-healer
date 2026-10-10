@@ -1,0 +1,53 @@
+# chaos-ai parameters. Every value shown is the default; delete anything you do not want to change.
+# `python -m chaosai config` prints the effective values. Typos and unknown keys are errors.
+# Safety values can only be made STRICTER than the hard limits in chaosai/safety.py (60 s, 50%,
+# 3000 ms, 3 s); anything looser is rejected at load time.
+
+app:
+  vote_url: http://localhost:8080/
+  result_url: http://localhost:8081/
+  compose_file: deploy/docker-compose.yml
+
+probe:                       # the synthetic user: one vote POST + one result GET per interval
+  interval_s: 1.0
+  timeout_s: 3.0             # a request slower than this counts as an error
+
+safety:                      # stricter-only
+  max_duration_s: 60         # longest any fault may run
+  abort_error_rate: 0.5      # auto-rollback when the WORST journey exceeds this ...
+  abort_p95_ms: 3000         # ... or this p95 latency ...
+  breach_seconds: 3          # ... for this many consecutive seconds
+  preflight_max_error_rate: 0.05   # refuse to inject if the baseline is already worse than this
+
+experiment:
+  baseline_s: 15             # steady-state window measured before each injection
+  recovery_timeout_s: 120    # give up waiting for recovery after this long
+  recovery_hold_s: 5         # "recovered" = this many consecutive seconds back near baseline
+  recovery_tolerance: 0.10   # within 10% of baseline ...
+  recovery_latency_slack_ms: 50    # ... plus this slack on p95 (10% of ~10 ms is below measurement jitter)
+
+faults:                      # per-fault defaults; planner and `chaos run` use these
+  kill:           {duration_s: 30}
+  stop:           {duration_s: 30}
+  pause:          {duration_s: 20}
+  network-delay:  {duration_s: 30, params: {latency_ms: 500}}
+  network-loss:   {duration_s: 30, params: {loss_pct: 30}}
+  cpu-limit:      {duration_s: 30, params: {cpus: 0.1}}
+  memory-limit:   {duration_s: 30, params: {mem: 32m}}
+  traffic-spike:  {duration_s: 30, params: {multiplier: 5}}
+
+planner:
+  top: 6                     # experiments per plan
+  max_per_target: 2          # variety caps
+  max_per_fault: 3
+  use_llm: true              # needs ANTHROPIC_API_KEY; falls back to the heuristic if unavailable
+  llm_model: claude-opus-5-5
+  llm_effort: medium         # low | medium | high | xhigh | max
+  llm_pool: 14               # how many top candidates the LLM may choose from
+
+agent:                       # the injector agent (`chaos agent`)
+  max_experiments: 6
+  cooldown_s: 10             # pause between experiments
+  health_wait_s: 60          # wait this long for all containers to be healthy before each injection
+  stop_on_abort: false       # true = stop the whole run after an auto-aborted experiment
+  max_consecutive_skips: 2   # stop if this many experiments in a row are refused by the safety guard

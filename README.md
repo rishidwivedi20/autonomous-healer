@@ -2,7 +2,7 @@
 
 Inject failures into a small microservices app (Docker's example-voting-app), observe the real impact, then (Day 2) have an AI agent diagnose what broke from stored evidence and recommend cited fixes. See [PLAN.md](PLAN.md).
 
-**Status: Day 1 complete and verified on real Docker Desktop (115 unit tests; baseline, redis crash, auto-abort and mid-run kill switch all exercised live).**
+**Status: Day 1 complete and verified on real Docker Desktop (190 unit tests; baseline, redis crash, auto-abort, mid-run kill switch and the injector agent all exercised live).**
 
 ## Reproduce from scratch (Windows, PowerShell)
 
@@ -27,6 +27,9 @@ python -m venv .venv; .\.venv\Scripts\pip install -r requirements.txt
 
 | Command | What it does |
 |---|---|
+| `chaos config` | Prints the effective parameters (`config.yaml` merged over the defaults) |
+| `chaos plan [--top N] [--offline] [--dry-run]` | Ranks which experiments to run first (heuristic risk score, re-ranked by Claude when `ANTHROPIC_API_KEY` is set) |
+| `chaos agent [--top N] [--max N] [--offline] [--dry-run] [-y]` | **The injector agent**: plans, then introduces the faults one at a time through the safety guard |
 | `chaos discover [--live]` | Builds the dependency map from the compose file (and running containers with `--live`) |
 | `chaos baseline --seconds N` | Observes the healthy system and saves the baseline |
 | `chaos run TARGET FAULT [options]` | One experiment: preflight, baseline window, inject, monitor each second, rollback, measure recovery, write `results/<id>.json` |
@@ -35,6 +38,24 @@ python -m venv .venv; .\.venv\Scripts\pip install -r requirements.txt
 | `chaos status` | Kill switch, recorded active faults, container state |
 
 Faults: `kill`, `stop`, `pause`, `cpu-limit`, `memory-limit`, `network-delay`, `network-loss`, `traffic-spike`. Parameters via `-p key=value` (e.g. `-p latency_ms=800`, `-p cpus=0.25`, `-p mem=32m`, `-p loss_pct=40`, `-p multiplier=8`).
+
+## Parameters
+
+Everything tunable lives in [`config.yaml`](config.yaml) (every value shown there is the default; `chaos config` prints the effective values). Flags override it. Two rules keep it safe: the `safety:` values can only be made *stricter* than the hard limits in `safety.py` (60 s, 50%, 3000 ms, 3 s), and anything looser or any unknown key is an error at load time, not a silent default.
+
+| Section | What it controls |
+|---|---|
+| `app` | vote/result URLs, compose file |
+| `probe` | probe interval and timeout |
+| `safety` | max fault duration, abort thresholds, preflight steady-state limit |
+| `experiment` | baseline window, recovery timeout / hold / tolerance |
+| `faults` | default duration and parameters per fault type (used by the planner and `chaos run`) |
+| `planner` | plan size, variety caps, LLM on/off, model, effort |
+| `agent` | max experiments, cooldown, health wait, stop-on-abort, refusal limit |
+
+## The injector agent
+
+`chaos agent` is the single component that introduces faults autonomously. It does not choose *what* to break (the planner does) or diagnose results (the Day 2 analyzer). For each planned experiment it: waits for every container to be healthy (and refuses to inject into a sick system), runs it through the safety guard and per-second abort rules, rolls back in a `finally`, pauses for a cooldown, and moves on. It stops the whole run on: kill switch, rollback problems, a Docker/injector error, unhealthy containers, or repeated refusals. It asks for confirmation unless `-y`; `--dry-run` plans and validates everything and injects nothing. Run logs go to `results/agent-runs/`.
 
 ## Safety
 
