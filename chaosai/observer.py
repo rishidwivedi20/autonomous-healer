@@ -58,6 +58,11 @@ class Store:
             self._db.execute(sql, args)
             self._db.commit()
 
+    def executemany(self, sql: str, rows: list[tuple]) -> None:
+        with self._lock:
+            self._db.executemany(sql, rows)
+            self._db.commit()
+
     def query(self, sql: str, args: tuple = ()) -> list[tuple]:
         with self._lock:
             return self._db.execute(sql, args).fetchall()

@@ -93,6 +93,14 @@ class PlannerCfg(_Base):
     llm_pool: int = Field(14, ge=1)
 
 
+class AnalyzerCfg(_Base):
+    use_llm: bool = True                 # needs ANTHROPIC_API_KEY; falls back to the rule-based analyzer if unavailable
+    llm_model: str = "claude-opus-5-5"
+    llm_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
+    max_turns: int = Field(16, ge=2)     # tool-call rounds before the agent is cut off
+    max_rejects: int = Field(3, ge=0)    # answers rejected for citing numbers the tools never returned, before giving up
+
+
 class AgentCfg(_Base):
     max_experiments: int = Field(6, ge=1)
     cooldown_s: float = Field(10.0, ge=0)          # pause between experiments
@@ -117,6 +125,7 @@ class Config(_Base):
     faults: dict[str, FaultCfg] = Field(default_factory=dict)
     planner: PlannerCfg = Field(default_factory=PlannerCfg)
     agent: AgentCfg = Field(default_factory=AgentCfg)
+    analyzer: AnalyzerCfg = Field(default_factory=AnalyzerCfg)
     dashboard: DashboardCfg = Field(default_factory=DashboardCfg)
 
     @field_validator("faults")

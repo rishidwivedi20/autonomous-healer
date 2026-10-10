@@ -17,14 +17,19 @@ import typer
 import yaml
 
 from . import config as config_mod
+from .envfile import load_env, mask
 from . import dashboard as dashboard_mod
+from . import analyzer as analyzer_mod
 from . import discovery, planner
+from .evidence import Evidence
 from .agent import InjectorAgent
 from .injector import InjectionError
 from .models import Experiment, Graph, Thresholds
 from .observer import DockerWatcher, LoadProbe, ProbeConfig, Store, unhealthy
 from .orchestrator import Orchestrator, measure_baseline
 from .safety import ExperimentLock, Guard, KillSwitch, SafetyViolation, is_managed
+
+load_env()          # ANTHROPIC_API_KEY from a git-ignored .env, if present
 
 app = typer.Typer(help="Safe chaos experiments against the voting app.", no_args_is_help=True)
 
@@ -156,6 +161,37 @@ def make_plan(c: config_mod.Config, top: int | None, offline: bool, compose: Pat
     result = planner.make_plan(graph, history, top or c.planner.top, use_llm=c.planner.use_llm and not offline,
                                cache_dir=RESULTS / "llm_cache", cfg=c.planner, faults=c.faults)
     return result, len(history)
+
+
+# ------------------------------------------------------------------ llm-check
+@app.command("llm-check")
+def llm_check(send: bool = typer.Option(True, help="--no-send only checks that a key is configured")):
+    """Check the Anthropic key: is one configured, and does one tiny request work? (Costs a fraction of a cent.)"""
+    c = cfg()
+    key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    if not key:
+        fail("no key found. Set ANTHROPIC_API_KEY (see README: 'Getting an Anthropic API key') or put it in .env", 1)
+    typer.echo(f"key found: {mask(key)}  (model: {c.analyzer.llm_model})")
+    if not send:
+        return
+    import anthropic
+    try:
+        resp = anthropic.Anthropic().messages.create(
+            model=c.analyzer.llm_model, max_tokens=1024, output_config={"effort": "low"},
+            messages=[{"role": "user", "content": "Reply with the single word: ok"}])
+    except anthropic.AuthenticationError:
+        fail("the key was rejected (401). Check that it is copied completely and not revoked.", 1)
+    except anthropic.PermissionDeniedError as e:
+        fail(f"the key is valid but not allowed to use this model/workspace (403): {e}", 1)
+    except anthropic.RateLimitError:
+        fail("rate limited (429); the key works but try again shortly", 1)
+    except anthropic.APIStatusError as e:
+        fail(f"API error {e.status_code}: {str(e)[:300]}\n(a 400 about credit balance means the account has no credits yet)", 1)
+    except anthropic.APIConnectionError as e:
+        fail(f"cannot reach the API ({type(e).__name__}); check your network/VPN/proxy", 1)
+    text = next((b.text for b in resp.content if getattr(b, "type", None) == "text"), "")
+    typer.echo(f"OK: {resp.model} answered {text.strip()!r}; stop_reason={resp.stop_reason}; "
+               f"tokens in={resp.usage.input_tokens} out={resp.usage.output_tokens}")
 
 
 # ------------------------------------------------------------------ config
@@ -298,6 +334,58 @@ def dashboard(port: int = typer.Option(None, help="default: dashboard.port"),
         server.server_close()
         table.stop()
         live.stop()
+
+
+# ------------------------------------------------------------------ analyze
+def print_analysis(a) -> None:
+    how = f"LLM agent ({a.model})" if a.generated_by == "llm" else "deterministic rules"
+    typer.echo(f"analysis by: {how}")
+    if a.fallback_reason:
+        typer.secho(f"  rule-based fallback because: {a.fallback_reason}", fg=typer.colors.YELLOW)
+    typer.echo(f"\n{a.summary}\n")
+    typer.echo("WEAKNESSES (most severe first)")
+    for i, w in enumerate(a.weaknesses, 1):
+        typer.echo(f"{i}. [{w.severity.upper()}] {w.title}   (services: {', '.join(w.services)})")
+        typer.echo(f"     {w.description}")
+        for e in w.evidence:
+            typer.echo(f"     evidence: {e.claim}   [{e.experiment_id}]")
+    typer.echo("\nFIXES")
+    for i, f in enumerate(a.fixes, 1):
+        typer.echo(f"{i}. {f.title}   (addresses: {'; '.join(f.addresses) or '-'})")
+        typer.echo(f"     why: {f.rationale}")
+        typer.echo("     change:")
+        for line in f.change.splitlines():
+            typer.echo(f"       {line}")
+    for n in a.notes[:8]:
+        typer.echo(f"note: {n}")
+
+
+@app.command()
+def analyze(ids: list[str] = typer.Option(None, "--id", "-i", help="experiment id(s) to analyse (default: all stored experiments)"),
+            last: int = typer.Option(None, "--last", help="only the most recent N experiments"),
+            offline: bool = typer.Option(False, help="skip the LLM; use the deterministic rule-based analyzer"),
+            dry_run: bool = typer.Option(False, help="print the analysis; do not write results/analysis.json")):
+    """Explain the stored experiments: per-experiment root cause, ranked weaknesses, and cited fixes."""
+    c = cfg()
+    ev = Evidence(RESULTS)
+    scope = list(ids) if ids else ev.ids()
+    unknown = [i for i in scope if i not in ev.ids()]
+    if unknown:
+        fail(f"unknown experiment id(s): {', '.join(unknown)}\nknown: {', '.join(ev.ids()) or '(none)'}")
+    if last:
+        scope = scope[-last:]
+    try:
+        result = analyzer_mod.analyze(ev, scope, c.analyzer, use_llm=not offline, cache_dir=RESULTS / "llm_cache")
+    except analyzer_mod.AnalyzerError as e:
+        fail(str(e), 1)
+    typer.echo(f"{len(scope)} experiment(s) in scope")
+    print_analysis(result)
+    if dry_run:
+        typer.echo("\n(dry run: results/analysis.json not written)")
+        return
+    out = RESULTS / "analysis.json"
+    out.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+    typer.echo(f"\nsaved {out}")
 
 
 # ------------------------------------------------------------------ baseline

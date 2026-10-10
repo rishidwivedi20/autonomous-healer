@@ -2,7 +2,7 @@
 
 Inject failures into a small microservices app (Docker's example-voting-app), observe the real impact, then (Day 2) have an AI agent diagnose what broke from stored evidence and recommend cited fixes. See [PLAN.md](PLAN.md).
 
-**Status: Day 1 complete and verified on real Docker Desktop (241 unit tests; baseline, redis crash, auto-abort, mid-run kill switch and the injector agent all exercised live).**
+**Status: Day 1 complete and verified on real Docker Desktop (305 unit tests; baseline, redis crash, auto-abort, mid-run kill switch and the injector agent all exercised live).**
 
 ## Reproduce from scratch (Windows, PowerShell)
 
@@ -28,6 +28,8 @@ python -m venv .venv; .\.venv\Scripts\pip install -r requirements.txt
 | Command | What it does |
 |---|---|
 | `chaos dashboard [--port N] [--rate R] [--open]` | **Live web page** at http://127.0.0.1:8765: charts for both user journeys, the redis queue and Postgres vote count, container table with restarts, event log, and buttons that inject real faults (plus KILL SWITCH / Reset) |
+| `chaos analyze [--offline] [--id ID] [--last N] [--dry-run]` | **Analyzer**: explains the stored experiments (root cause, blast radius, ranked weaknesses, concrete fixes). Every claim cites numbers that the data tools returned. Uses the Claude agent when a key is set, otherwise the deterministic rule-based analyzer |
+| `chaos llm-check` | Checks the Anthropic key with one tiny request (prints the key masked) |
 | `chaos config` | Prints the effective parameters (`config.yaml` merged over the defaults) |
 | `chaos plan [--top N] [--offline] [--dry-run]` | Ranks which experiments to run first (heuristic risk score, re-ranked by Claude when `ANTHROPIC_API_KEY` is set) |
 | `chaos agent [--top N] [--max N] [--offline] [--dry-run] [-y]` | **The injector agent**: plans, then introduces the faults one at a time through the safety guard |
@@ -39,6 +41,23 @@ python -m venv .venv; .\.venv\Scripts\pip install -r requirements.txt
 | `chaos status` | Kill switch, recorded active faults, container state |
 
 Faults: `kill`, `stop`, `pause`, `cpu-limit`, `memory-limit`, `network-delay`, `network-loss`, `traffic-spike`. Parameters via `-p key=value` (e.g. `-p latency_ms=800`, `-p cpus=0.25`, `-p mem=32m`, `-p loss_pct=40`, `-p multiplier=8`).
+
+## Getting an Anthropic API key
+
+The planner's LLM ranking and the analyzer agent need an API key. Without one everything still works: both fall back to deterministic rules and say so.
+
+1. Open the Anthropic Console (https://platform.claude.com) and sign in or create an account. API usage is billed separately from a Claude.ai chat subscription.
+2. Add credits under **Settings -> Billing**. A key with no credit balance is rejected.
+3. Go to **Settings -> API keys -> Create key**, name it `chaos-ai`, and copy the key at once (it is shown only once). Menu names may differ slightly.
+4. Give it to chaos-ai without pasting it anywhere public: run `notepad .env` in the repo folder and save one line `ANTHROPIC_API_KEY=sk-ant-...`. `.env` is git-ignored and only `ANTHROPIC_*` / `CHAOSAI_*` names are read from it. (Alternatively set it for one PowerShell session: `$env:ANTHROPIC_API_KEY = "sk-ant-..."`.)
+5. Check it: `.\chaos.cmd llm-check`. Expect `OK: claude-opus-5-5 answered 'ok'`. This costs a fraction of a cent and prints the token counts so you can see what a request costs.
+6. Use it: `.\chaos.cmd plan --dry-run` (planner: LLM) and `.\chaos.cmd analyze` (analyzer agent). Validated analyses are cached in `results/llm_cache/`, so re-running on unchanged results makes no API call.
+
+Never commit a key or paste it into a chat. If one leaks, revoke it in the Console and create a new one.
+
+## The analyzer
+
+`chaos analyze` turns the stored results into findings. The agent reads only stored data through read-only tools (`list_experiments`, `get_experiment`, `get_metrics`, `get_gauges`, `get_container_events`, `get_graph`, `get_baseline`) and finishes by submitting a structured analysis: per experiment `hypothesis_held` (only if a hypothesis was stored), `root_cause` and `blast_radius`; weaknesses ranked by severity; and fixes with a concrete change (compose/config snippet) each. A submission is **rejected, with reasons, and the model must retry** unless every experiment is covered, every weakness and fix cites evidence, weaknesses are ranked, and every number in an evidence claim is one the tools actually returned for that experiment. That check is necessary rather than sufficient (a number can coincide with an unrelated stored value), so treat citations as pointers to verify, and note that causes the data cannot measure are labelled as inferences. If anything fails (no key, no network, refusal, no valid answer) the deterministic rule-based analyzer produces the same schema and the result records why.
 
 ## Live dashboard
 
