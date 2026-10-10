@@ -166,9 +166,17 @@ def make_plan(c: config_mod.Config, top: int | None, offline: bool, compose: Pat
 
 # ------------------------------------------------------------------ llm-check
 @app.command("llm-check")
-def llm_check(send: bool = typer.Option(True, help="--no-send only checks that a key is configured")):
-    """Check the Anthropic key: is one configured, and does one tiny request work? (Costs a fraction of a cent.)"""
+def llm_check(send: bool = typer.Option(True, help="--no-send only checks that a key is configured"),
+              provider: str = typer.Option(None, help="anthropic | gemini (default: analyzer.provider)"),
+              models: bool = typer.Option(False, "--models", help="gemini: list the models this key can call"),
+              model: str = typer.Option(None, "--model", help="gemini: model to test (default: analyzer.llm_model, else gemini-3.8-flash)")):
+    """Check the LLM key: is one configured, and does one tiny request work? (Costs a fraction of a cent or nothing.)"""
     c = cfg()
+    provider = provider or c.analyzer.provider
+    if provider == "gemini":
+        return llm_check_gemini(c, send, models, model)
+    if provider != "anthropic":
+        fail(f"unknown provider {provider!r}; use anthropic or gemini")
     key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
     if not key:
         fail("no key found. Set ANTHROPIC_API_KEY (see README: 'Getting an Anthropic API key') or put it in .env", 1)
@@ -192,6 +200,35 @@ def llm_check(send: bool = typer.Option(True, help="--no-send only checks that a
         fail(f"cannot reach the API ({type(e).__name__}); check your network/VPN/proxy", 1)
     text = next((b.text for b in resp.content if getattr(b, "type", None) == "text"), "")
     typer.echo(f"OK: {resp.model} answered {text.strip()!r}; stop_reason={resp.stop_reason}; "
+               f"tokens in={resp.usage.input_tokens} out={resp.usage.output_tokens}")
+
+
+def llm_check_gemini(c: config_mod.Config, send: bool, list_models: bool, model: str | None = None) -> None:
+    from .gemini import GeminiClient, GeminiError, api_key
+    key = api_key()
+    if not key:
+        fail("no Gemini key found. Create one at https://aistudio.google.com/apikey and put GEMINI_API_KEY=... in .env", 1)
+    typer.echo(f"key found: {mask(key)}  (planner model: {c.planner.llm_model}, analyzer model: {c.analyzer.llm_model}; "
+               f"provider in config: planner={c.planner.provider}, analyzer={c.analyzer.provider})")
+    if not send and not list_models:
+        return
+    try:
+        client = GeminiClient()
+        if list_models:
+            names = client.list_models()
+            typer.echo(f"{len(names)} model(s) this key can call:\n  " + "\n  ".join(names))
+        if not send:
+            return
+        model = model or (c.analyzer.llm_model if c.analyzer.provider == "gemini" else "gemini-3.8-flash")
+        resp = client.messages.create(model=model, max_tokens=64, messages=[{"role": "user", "content": "Reply with the single word: ok"}])
+    except GeminiError as e:
+        hint = {400: "  (a 400 usually means the key is invalid or the model name is wrong: try --models)",
+                403: "  (the key is valid but not allowed to use this model/region)",
+                404: "  (that model name does not exist for this key: try --models)",
+                429: "  (the free tier is rate limited per model; the message says when it resets)"}.get(e.status or 0, "")
+        fail(f"Gemini error: {e}{hint}", 1)
+    text = next((b.text for b in resp.content if getattr(b, "type", None) == "text"), "")
+    typer.echo(f"OK: {model} answered {text.strip()!r}; stop_reason={resp.stop_reason}; "
                f"tokens in={resp.usage.input_tokens} out={resp.usage.output_tokens}")
 
 

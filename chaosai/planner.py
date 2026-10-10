@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field, ValidationError
 from .models import Experiment, ExperimentResult, Graph, Plan, PlannedExperiment, Service
 
 from .config import DEFAULT_FAULTS, PlannerCfg
+from .llmclient import make_client
 
 MODEL = "claude-opus-5-5"
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
@@ -302,7 +303,7 @@ def llm_plan(graph: Graph, history: list[dict], n: int = 6, client=None, cache_d
     cands = candidates(graph, history, faults)[:cfg.llm_pool]
     user = _prompt(graph, cands, history, n)
     notes = []
-    cache = _cache_path(cache_dir, f"{cfg.llm_model}|{cfg.llm_effort}", SYSTEM, user) if cache_dir else None
+    cache = _cache_path(cache_dir, f"{cfg.provider}:{cfg.llm_model}|{cfg.llm_effort}", SYSTEM, user) if cache_dir else None
     text = None
     if cache and cache.exists():
         text = json.loads(cache.read_text(encoding="utf-8"))["text"]
@@ -310,8 +311,7 @@ def llm_plan(graph: Graph, history: list[dict], n: int = 6, client=None, cache_d
     try:
         if text is None:
             if client is None:
-                import anthropic
-                client = anthropic.Anthropic()
+                client = make_client(cfg.provider)
             text = _call_model(client, user, cfg.llm_model, cfg.llm_effort)
         experiments = _validate(text, cands, n)
     except PlannerError:

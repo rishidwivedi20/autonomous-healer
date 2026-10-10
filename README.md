@@ -44,6 +44,22 @@ python -m venv .venv; .\.venv\Scripts\pip install -r requirements.txt
 
 Faults: `kill`, `stop`, `pause`, `cpu-limit`, `memory-limit`, `network-delay`, `network-loss`, `traffic-spike`. Parameters via `-p key=value` (e.g. `-p latency_ms=800`, `-p cpus=0.25`, `-p mem=32m`, `-p loss_pct=40`, `-p multiplier=8`).
 
+## Using a free Gemini key instead (Google AI Studio)
+
+The planner and analyzer can run on Gemini instead of Claude. Nothing else changes: the same evidence validator, caches and rule-based fallback apply (`chaosai/gemini.py` is a drop-in for the Anthropic client).
+
+1. Create a key at https://aistudio.google.com/apikey and put `GEMINI_API_KEY=...` in the git-ignored `.env`.
+2. In `config.yaml` set `provider: gemini` and a model (for example `llm_model: gemini-3.5-flash`) under both `planner:` and `analyzer:`. A Claude model name with the gemini provider (or the reverse) is rejected at load time.
+3. `chaos llm-check --provider gemini --models` lists the models the key can call; `chaos llm-check --provider gemini --model <name>` sends one tiny request. Model availability changes (a model can exist yet be closed to new keys): test the name before relying on it.
+
+**Free-tier limits are tight.** Observed on a real key: **20 generate requests per day per model** (`GenerateRequestsPerDayPerProjectPerModel-FreeTier`). One analysis is roughly 10 requests (the tool loop makes one request per turn), so expect about one full analysis per model per day, and the planner needs one. When the quota is spent the adapter fails immediately with what ran out and when it resets, and the planner and analyzer fall back to the rules and record why. To make the most of it:
+
+- validated answers are cached on disk (`results/llm_cache/`), so repeating the same analysis costs nothing: run it live once, then replay it;
+- limit the scope with `chaos analyze --id <id> ...` or `--last N` (a 6-experiment analysis used about 220k input tokens);
+- quotas are per model, so the planner and analyzer can use different models.
+
+Gemini's suggested fixes are validated for evidence (every number it cites must be one a tool returned) but not for realism: it may propose config keys the app does not read. Treat `change` snippets as suggestions to review.
+
 ## Getting an Anthropic API key
 
 The planner's LLM ranking and the analyzer agent need an API key. Without one everything still works: both fall back to deterministic rules and say so.

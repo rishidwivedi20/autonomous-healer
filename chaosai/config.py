@@ -83,22 +83,45 @@ DEFAULT_FAULTS: dict[str, FaultCfg] = {
 }
 
 
+Provider = Literal["anthropic", "gemini"]
+
+
+def _check_model(provider: str, model: str) -> None:
+    """A model name from the other provider would only fail later with a 404, so say so at load time."""
+    if provider == "gemini" and model.startswith("claude"):
+        raise ValueError(f"provider is gemini but llm_model is {model!r}; set a Gemini model (see `chaos llm-check --models`)")
+    if provider == "anthropic" and model.startswith("gemini"):
+        raise ValueError(f"provider is anthropic but llm_model is {model!r}; set a Claude model or switch the provider to gemini")
+
+
 class PlannerCfg(_Base):
     top: int = Field(6, ge=1)
     max_per_target: int = Field(2, ge=1)
     max_per_fault: int = Field(3, ge=1)
     use_llm: bool = True
+    provider: Provider = "anthropic"      # anthropic (ANTHROPIC_API_KEY) | gemini (GEMINI_API_KEY, Google AI Studio)
     llm_model: str = "claude-opus-5-5"
-    llm_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
+    llm_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"     # Anthropic only
     llm_pool: int = Field(14, ge=1)
+
+    @model_validator(mode="after")
+    def _model_matches_provider(self):
+        _check_model(self.provider, self.llm_model)
+        return self
 
 
 class AnalyzerCfg(_Base):
-    use_llm: bool = True                 # needs ANTHROPIC_API_KEY; falls back to the rule-based analyzer if unavailable
+    use_llm: bool = True                 # needs a key for `provider`; falls back to the rule-based analyzer if unavailable
+    provider: Provider = "anthropic"     # anthropic (ANTHROPIC_API_KEY) | gemini (GEMINI_API_KEY, Google AI Studio)
     llm_model: str = "claude-opus-5-5"
-    llm_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
+    llm_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"     # Anthropic only
     max_turns: int = Field(16, ge=2)     # tool-call rounds before the agent is cut off
     max_rejects: int = Field(3, ge=0)    # answers rejected for citing numbers the tools never returned, before giving up
+
+    @model_validator(mode="after")
+    def _model_matches_provider(self):
+        _check_model(self.provider, self.llm_model)
+        return self
 
 
 class AgentCfg(_Base):

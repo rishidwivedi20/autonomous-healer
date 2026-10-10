@@ -26,6 +26,7 @@ from . import rules
 from .analysis import SUBMIT_TOOL, Analysis, Recorder, validate
 from .config import AnalyzerCfg
 from .evidence import TOOLS, Evidence
+from .llmclient import make_client
 from .planner import FALLBACK_BETA
 
 MAX_TOOL_OUTPUT_CHARS = 24_000
@@ -69,7 +70,7 @@ def _prompt(ids: list[str]) -> str:
 
 
 def _cache_path(cache_dir: Path, cfg: AnalyzerCfg, ids: list[str], fingerprint: str) -> Path:
-    raw = "\x00".join((cfg.llm_model, cfg.llm_effort, SYSTEM, _prompt(ids), fingerprint,
+    raw = "\x00".join((f"{cfg.provider}:{cfg.llm_model}", cfg.llm_effort, SYSTEM, _prompt(ids), fingerprint,
                        json.dumps(SUBMIT_TOOL, sort_keys=True), json.dumps(TOOLS, sort_keys=True)))
     return Path(cache_dir) / f"analysis-{hashlib.sha256(raw.encode()).hexdigest()[:24]}.json"
 
@@ -168,8 +169,7 @@ def analyze(ev: Evidence, ids: list[str], cfg: AnalyzerCfg, use_llm: bool = True
             pass                                                         # corrupt cache entry: ignore it
     try:
         if client is None:
-            import anthropic
-            client = anthropic.Anthropic()
+            client = make_client(cfg.provider)
         a, stats = run_agent(ev, ids, client, cfg)
     except AnalyzerError as e:
         return _by_rules(ev, ids, str(e))

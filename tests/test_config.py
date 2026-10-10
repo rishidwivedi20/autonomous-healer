@@ -28,8 +28,14 @@ def test_defaults_equal_the_hard_coded_values_the_code_used_before():
 
 
 def test_repo_config_yaml_matches_the_defaults():
-    """config.yaml documents the defaults; if it drifts from them, behaviour silently changes."""
-    assert config.load(REPO_CONFIG).model_dump() == config.load(Path("does-not-exist.yaml")).model_dump()
+    """config.yaml documents the defaults; if it drifts from them, behaviour silently changes. The one deliberate
+    exception is which LLM provider/model the planner and analyzer use: that is the team's deployment choice."""
+    def dump(path):
+        d = config.load(path).model_dump()
+        for section in ("planner", "analyzer"):
+            d[section].pop("provider"), d[section].pop("llm_model")
+        return d
+    assert dump(REPO_CONFIG) == dump(Path("does-not-exist.yaml"))
 
 
 def test_partial_file_overrides_only_what_it_names(tmp_path):

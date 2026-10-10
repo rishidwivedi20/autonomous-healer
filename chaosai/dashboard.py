@@ -323,13 +323,22 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_POST(self):
+        # read the (bounded) body before answering anything, even a refusal: replying to a request whose body is still
+        # in flight can reset the client's connection (seen on Windows) instead of delivering the 403
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        in_bounds = 0 <= length <= 10_000
+        raw = self.rfile.read(length) if in_bounds else b""
+        if not in_bounds:
+            self.close_connection = True
         if not self._host_ok() or not self._origin_ok():
             return self._json(403, {"error": "cross-origin request refused"})
         if self.headers.get("X-Chaos") != "1" or "application/json" not in (self.headers.get("Content-Type") or ""):
             return self._json(403, {"error": "missing X-Chaos header or JSON content type"})
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-            body = json.loads(self.rfile.read(length) or b"{}") if length <= 10_000 else None
+            body = json.loads(raw or b"{}") if in_bounds else None
         except (ValueError, json.JSONDecodeError):
             body = None
         if not isinstance(body, dict):

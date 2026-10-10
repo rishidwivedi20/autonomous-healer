@@ -42,14 +42,16 @@ planner:
   top: 6                     # experiments per plan
   max_per_target: 2          # variety caps
   max_per_fault: 3
-  use_llm: true              # needs ANTHROPIC_API_KEY; falls back to the heuristic if unavailable
-  llm_model: claude-opus-5-5
+  use_llm: true              # needs the key for `provider`; falls back to the heuristic if unavailable
+  provider: gemini           # anthropic (ANTHROPIC_API_KEY) | gemini (GEMINI_API_KEY from Google AI Studio)
+  llm_model: gemini-3.5-flash-lite
   llm_effort: medium         # low | medium | high | xhigh | max
   llm_pool: 14               # how many top candidates the LLM may choose from
 
 analyzer:                    # `chaos analyze`: the tool-using agent that explains the stored results
-  use_llm: true              # needs ANTHROPIC_API_KEY; falls back to the deterministic rule-based analyzer
-  llm_model: claude-opus-5-5
+  use_llm: true              # needs the key for `provider`; falls back to the deterministic rule-based analyzer
+  provider: gemini           # anthropic (ANTHROPIC_API_KEY) | gemini (GEMINI_API_KEY from Google AI Studio)
+  llm_model: gemini-3-flash-preview
   llm_effort: medium         # low | medium | high | xhigh | max
   max_turns: 16              # tool-call rounds before the agent is cut off
   max_rejects: 3             # answers rejected for citing numbers the tools never returned, before giving up
