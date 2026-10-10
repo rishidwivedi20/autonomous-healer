@@ -14,8 +14,8 @@ from pathlib import Path
 import typer
 import yaml
 
-from . import discovery
-from .models import Experiment, Thresholds
+from . import discovery, planner
+from .models import Experiment, Graph, Thresholds
 from .observer import DockerWatcher, LoadProbe, ProbeConfig, Store, unhealthy
 from .orchestrator import Orchestrator, measure_baseline
 from .injector import InjectionError
@@ -72,6 +72,45 @@ def discover(live: bool = typer.Option(False, help="also read env vars from runn
     for n in notes:
         typer.echo(f"manual: {n}")
     typer.echo(f"wrote {out}")
+
+
+# ------------------------------------------------------------------ plan
+@app.command()
+def plan(top: int = typer.Option(6, "--top", "-n", help="how many experiments to plan"),
+         offline: bool = typer.Option(False, help="skip the LLM; use the deterministic heuristic only"),
+         dry_run: bool = typer.Option(False, help="print the ranked plan; do not write results/plan.json"),
+         compose: Path = typer.Option(COMPOSE)):
+    """Rank which experiments to run first (heuristic risk score, re-ranked by Claude when available)."""
+    graph_file = RESULTS / "graph.json"
+    if graph_file.exists():
+        graph = Graph.model_validate(json.loads(graph_file.read_text(encoding="utf-8")))
+    else:
+        graph, notes = discovery.discover(compose, compose.parent / "graph.overrides.yaml")
+        discovery.write_graph(graph, graph_file, notes)
+        typer.echo(f"(no graph.json yet; discovered it from {compose})")
+    history = planner.load_history(RESULTS)
+    result = planner.make_plan(graph, history, top, use_llm=not offline, cache_dir=RESULTS / "llm_cache")
+
+    who = f"LLM ({result.model})" if result.planner == "llm" else "heuristic"
+    typer.echo(f"planner: {who}; {len(history)} past experiment(s) considered")
+    if result.fallback_reason:
+        typer.secho(f"  fell back to heuristic: {result.fallback_reason}", fg=typer.colors.YELLOW)
+    for n in result.notes:
+        typer.echo(f"  {n}")
+    typer.echo("")
+    for p in result.experiments:
+        f = p.factors
+        typer.echo(f"{p.rank}. {p.target} / {p.fault}   score {p.risk_score}  "
+                   f"(criticality {f['criticality']:g} x fragility {f['fragility']:g} x untested {f['untested']:g} x fault {f['fault_weight']:g})")
+        typer.echo(f"     duration {p.duration_s}s, params {p.params or '-'}")
+        typer.echo(f"     why:        {p.reason}")
+        typer.echo(f"     hypothesis: {p.hypothesis}")
+    if dry_run:
+        typer.echo("\n(dry run: results/plan.json not written)")
+        return
+    out = RESULTS / "plan.json"
+    out.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+    typer.echo(f"\nsaved {out}")
 
 
 # ------------------------------------------------------------------ baseline

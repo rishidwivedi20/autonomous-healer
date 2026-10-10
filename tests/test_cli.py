@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -102,3 +103,35 @@ def test_reset_refuses_when_restore_fails(isolated, monkeypatch):
 def test_parse_params_types():
     assert cli.parse_params(["latency_ms=800", "cpus=0.25", "mem=32m", "flag=true"]) == {
         "latency_ms": 800, "cpus": 0.25, "mem": "32m", "flag": True}
+
+
+# ---- plan
+def test_plan_offline_dry_run_prints_ranking_and_writes_nothing(isolated):
+    r = runner.invoke(cli.app, ["plan", "--offline", "--dry-run", "--top", "4"])
+    assert r.exit_code == 0, r.output
+    assert "planner: heuristic" in r.output and "1. db / kill" in r.output and "hypothesis:" in r.output
+    assert "4. " in r.output and "5. " not in r.output
+    assert not (isolated / "plan.json").exists()
+
+
+def test_plan_writes_plan_json_and_reports_llm_fallback(isolated, monkeypatch):
+    import anthropic
+
+    def no_creds(*a, **k):
+        raise TypeError("Could not resolve authentication method")   # as the real SDK does without credentials
+    monkeypatch.setattr(anthropic, "Anthropic", no_creds)
+    r = runner.invoke(cli.app, ["plan", "--top", "3"])
+    assert r.exit_code == 0, r.output
+    assert "fell back to heuristic" in r.output and "ANTHROPIC_API_KEY" in r.output
+    saved = json.loads((isolated / "plan.json").read_text())
+    assert saved["planner"] == "heuristic" and len(saved["experiments"]) == 3
+
+
+def test_plan_counts_past_experiments(isolated):
+    from chaosai.models import Experiment, ExperimentResult, Stats
+    res = ExperimentResult(experiment=Experiment(id="old", target="db", fault="kill"), started_at=1, ended_at=2,
+                           baseline=Stats(), during=Stats())
+    (isolated / "old.json").write_text(res.model_dump_json())
+    r = runner.invoke(cli.app, ["plan", "--offline", "--dry-run"])
+    assert "1 past experiment(s) considered" in r.output
+    assert "1. db / kill" not in r.output          # already tested once, loses its untested bonus

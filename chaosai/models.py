@@ -46,6 +46,7 @@ class Service(BaseModel):
     fan_in: int = 0
     fan_out: int = 0
     on_critical_path: bool = False
+    entrypoint: bool = False        # publishes a host port (user-facing)
 
 
 class Graph(BaseModel):
@@ -82,3 +83,24 @@ class ExperimentResult(BaseModel):
     rollback_errors: list[str] = Field(default_factory=list)
     missing_signals: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)   # what the injector did / dry-run plan
+
+
+class PlannedExperiment(BaseModel):
+    rank: int
+    target: str
+    fault: str
+    params: dict = Field(default_factory=dict)
+    duration_s: int = 30
+    hypothesis: str
+    reason: str
+    risk_score: float
+    factors: dict[str, float] = Field(default_factory=dict)   # criticality, fragility, untested, fault_weight
+
+
+class Plan(BaseModel):
+    planner: str                              # "llm" | "heuristic"
+    created_at: float
+    model: Optional[str] = None
+    fallback_reason: Optional[str] = None     # why the heuristic was used instead of the LLM
+    notes: list[str] = Field(default_factory=list)
+    experiments: list[PlannedExperiment]

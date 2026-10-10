@@ -111,6 +111,7 @@ def build_graph(compose: dict, extra_edges: dict[str, set[str]] | None = None) -
             has_limits=_has_limits(spec),
             stateful=_stateful(spec, named_volumes),
             depends_on=sorted(deps),
+            entrypoint=bool(spec.get("ports")),
         )
 
     for s in services.values():
