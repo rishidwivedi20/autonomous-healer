@@ -169,7 +169,8 @@ class AnalyzerCfg(_Base):
     provider: Provider = "anthropic"     # anthropic | gemini | mistral | openrouter (one key each), or pool (see `members`)
     llm_model: str = "claude-opus-5-5"   # ignored with provider: pool
     llm_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"     # Anthropic only
-    max_turns: int = Field(16, ge=2)     # tool-call rounds before the agent is cut off
+    max_turns: int = Field(16, ge=2)     # tool-call rounds before the agent is cut off (enough for up to 3 experiments)
+    turns_per_experiment: int = Field(4, ge=0)    # extra rounds for each experiment beyond three; one-call-per-turn models need them
     max_rejects: int = Field(3, ge=0)    # answers rejected for citing numbers the tools never returned, before giving up
     members: list[PoolMember] = Field(default_factory=list)                      # for provider: pool
 

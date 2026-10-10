@@ -70,8 +70,9 @@ def clock():
     return Clock()
 
 
-def make_pool(tmp_path, clock, members, fakes):
-    return PoolClient(members, state_path=tmp_path / "pool.json", clock=clock, make=lambda m: fakes[pool_label(m)])
+def make_pool(tmp_path, clock, members, fakes, alternate=False):
+    """Pure round-robin by default, so the rotation tests are about rotation; provider alternation has its own tests."""
+    return PoolClient(members, state_path=tmp_path / "pool.json", clock=clock, make=lambda m: fakes[pool_label(m)], alternate_providers=alternate)
 
 
 def state(tmp_path):
@@ -488,3 +489,63 @@ def test_a_cached_plan_reports_the_member_that_really_produced_it_not_the_config
     again = planner.llm_plan(g, [], n=3, client=None, cache_dir=tmp_path / "cache", cfg=cfg)          # no client: it must come from the cache
     assert first_plan.model == "openrouter:v/b:free" and again.model == "openrouter:v/b:free"
     assert any("served from cache" in n for n in again.notes)
+
+
+# ---------------------------------------------------------------- consecutive steps use different providers
+GM1 = PoolMember(provider="gemini", model="g-1")
+GM2 = PoolMember(provider="gemini", model="g-2")
+
+
+def answered_by(tmp_path, clock, members, fakes, alternate=True):
+    """Run one new conversation through a fresh pool (like a separate command) and say which member answered it."""
+    p = make_pool(tmp_path, clock, members, fakes, alternate)
+    first(p)
+    return p.used_models[0]
+
+
+def provider_sequence(tmp_path, clock, members, fakes, runs, alternate=True):
+    return [answered_by(tmp_path, clock, members, fakes, alternate).split(":")[0] for _ in range(runs)]
+
+
+def test_consecutive_runs_use_different_providers_when_more_than_one_is_available(tmp_path, clock):
+    members = [GM1, GM2, B]
+    fakes = {pool_label(m): Fake(*[ok()] * 6) for m in members}
+    assert provider_sequence(tmp_path, clock, members, fakes, 6) == ["gemini", "openrouter", "gemini", "openrouter", "gemini", "openrouter"]
+
+
+def test_without_the_preference_two_models_of_one_provider_can_answer_back_to_back(tmp_path, clock):
+    members = [GM1, GM2, B]
+    fakes = {pool_label(m): Fake(*[ok()] * 6) for m in members}
+    assert provider_sequence(tmp_path, clock, members, fakes, 3, alternate=False) == ["gemini", "gemini", "openrouter"]
+
+
+def test_a_single_provider_keeps_rotating_through_its_own_models(tmp_path, clock):
+    members = [GM1, GM2]
+    fakes = {pool_label(m): Fake(*[ok()] * 4) for m in members}
+    assert [answered_by(tmp_path, clock, members, fakes) for _ in range(4)] == ["gemini:g-1", "gemini:g-2", "gemini:g-1", "gemini:g-2"]
+
+
+def test_the_preferred_provider_is_skipped_when_it_is_unavailable(tmp_path, clock):
+    members = [GM1, B]
+    fakes = {pool_label(GM1): Fake(ok(), ok(), ok()), pool_label(B): Fake(Failure("no credits", 402))}
+    assert [answered_by(tmp_path, clock, members, fakes) for _ in range(3)] == ["gemini:g-1"] * 3     # OpenRouter failed once and is cooling
+    assert len(fakes[pool_label(B)].calls) == 1
+
+
+def test_the_last_provider_is_saved_so_separate_commands_alternate_too(tmp_path, clock):
+    members = [GM1, B]
+    fakes = {pool_label(m): Fake(ok(), ok()) for m in members}
+    first(make_pool(tmp_path, clock, members, fakes, alternate=True))
+    assert state(tmp_path)["last_provider"] == "gemini"
+    first(make_pool(tmp_path, clock, members, fakes, alternate=True))
+    assert state(tmp_path)["last_provider"] == "openrouter"
+
+
+def test_a_run_under_way_ignores_the_preference_and_stays_on_its_member(tmp_path, clock):
+    members = [GM1, B]
+    fakes = {pool_label(GM1): Fake(ok(), ok(), ok()), pool_label(B): Fake(ok())}
+    p = make_pool(tmp_path, clock, members, fakes, alternate=True)
+    first(p)
+    p.create(messages=MID, max_tokens=10)
+    p.create(messages=MID + MID, max_tokens=10)
+    assert len(fakes[pool_label(GM1)].calls) == 3 and fakes[pool_label(B)].calls == []

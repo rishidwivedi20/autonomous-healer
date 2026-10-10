@@ -8,6 +8,9 @@ How it behaves
   * A NEW conversation (one message: the planner's single call, or the analyzer's first) starts on the next member in
     rotation. The rotation position is saved in `results/llm_pool.json`, so successive command-line runs really
     spread across members instead of always starting on the first.
+  * Consecutive runs prefer DIFFERENT PROVIDERS: the planner, the analysis and the report each go to a provider other
+    than the one that answered the step before, whenever another provider is available (`alternate_providers`, on by
+    default). With only one provider left it simply keeps rotating through that provider's models.
   * A conversation then STAYS on its member for every turn: a tool loop replays provider-specific parts (Gemini's thought
     signatures), so hopping between members mid-run would break them.
   * If a member fails (rate limit, spent quota, overload, bad key, unknown model, network), it is put on a cooldown
@@ -72,10 +75,11 @@ class PoolClient:
     """Duck-types the parts of anthropic.Anthropic() the planner and analyzer use."""
 
     def __init__(self, members: list[PoolMember], state_path: Path | str | None = None,
-                 clock: Callable[[], float] = time.time, make: Callable = make_member_client):
+                 clock: Callable[[], float] = time.time, make: Callable = make_member_client, alternate_providers: bool = True):
         if not members:
             raise PoolError("the pool has no members (set `members:` in config.yaml)")
         self.members, self.clock, self._make = list(members), clock, make
+        self.alternate_providers = alternate_providers
         self.state_path = Path(state_path) if state_path else default_state_path()
         self._clients: dict[int, object] = {}
         self._current: Optional[int] = None
@@ -133,6 +137,9 @@ class PoolClient:
         else:
             start = int(state.get("next", 0)) % n
             order = [(start + i) % n for i in range(n)]
+            last = state.get("last_provider")
+            if self.alternate_providers and last:                          # a different provider from the previous run when one is available
+                order = [i for i in order if self.members[i].provider != last] + [i for i in order if self.members[i].provider == last]
         problems: list[str] = []
         for idx in order:
             m = self.members[idx]
@@ -165,6 +172,7 @@ class PoolClient:
             if not mid_run:
                 state = self._load()
                 state["next"] = (idx + 1) % n                                # the next new run starts on the member after this one
+                state["last_provider"] = m.provider
                 self._save(state)
             return resp
         raise PoolError("no pool member could answer: " + "; ".join(problems))

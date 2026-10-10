@@ -354,3 +354,17 @@ def test_llm_check_with_a_key_masks_it_and_reports_the_answer(monkeypatch):
     r = runner.invoke(cli.app, ["llm-check"])
     assert r.exit_code == 0 and "sk-ant-...wxyz" in r.output and "SUPERSECRET" not in r.output
     assert "OK: claude-opus-5-5 answered 'ok'" in r.output and "in=12 out=3" in r.output
+
+
+# ---------------------------------------------------------------- the turn budget grows with the scope
+def test_turn_budget_is_flat_up_to_three_experiments_then_grows_and_is_capped():
+    from chaosai.analyzer import TURN_CAP, effective_turns
+    cfg = AnalyzerCfg(max_turns=16, turns_per_experiment=4)
+    assert [effective_turns(cfg, n) for n in (1, 2, 3)] == [16, 16, 16]
+    assert effective_turns(cfg, 6) == 28 and effective_turns(cfg, 10) == 44
+    assert effective_turns(cfg, 500) == TURN_CAP == 80
+    assert effective_turns(AnalyzerCfg(max_turns=16, turns_per_experiment=0), 50) == 16        # the old flat behaviour is still available
+
+
+def test_the_system_prompt_tells_the_model_to_batch_its_tool_calls():
+    assert "several tools in one turn" in analyzer.SYSTEM

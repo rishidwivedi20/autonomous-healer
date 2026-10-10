@@ -268,7 +268,19 @@ class DockerInjector:
             mem, swap = orig["memory"], (orig["memswap"] if orig["memswap"] != 0 else -1)
         else:
             mem, swap = self._engine_memory(), -1
-        c.update(mem_limit=mem, memswap_limit=swap)
+        attempts = [(mem, swap)]
+        if swap == -1:      # Docker Desktop's runc can reject "unlimited swap" when lifting a cap ("memory+swap limit should be
+            attempts.append((mem, mem * 2))     # >= memory limit"); twice the memory is Docker's own default and is accepted
+        failure = None
+        for m_, s_ in attempts:
+            try:
+                c.update(mem_limit=m_, memswap_limit=s_)
+                failure = None
+                break
+            except Exception as e:
+                failure = e
+        if failure is not None:
+            raise failure
         c.reload()
         now = c.attrs.get("HostConfig", {}).get("Memory") or 0
         if now != mem:

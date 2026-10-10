@@ -75,10 +75,10 @@ A third provider, as a backup for the other two (`chaosai/mistral.py`, same drop
 A fourth provider (`chaosai/openrouter.py`; it shares the OpenAI-style adapter with Mistral). Model ids look like `vendor/model`, for example `openai/gpt-oss-120b` or its free variant `openai/gpt-oss-120b:free`.
 
 1. Create a key at https://openrouter.ai/keys and put `OPENROUTER_API_KEY=...` in the git-ignored `.env`.
-2. In `config.yaml` set `provider: openrouter` and `llm_model: openai/gpt-oss-120b:free` (or the paid id) under `planner:` and `analyzer:`.
+2. In `config.yaml` set `provider: openrouter` and `llm_model: openai/gpt-oss-120b` under `planner:` and `analyzer:`. That paid id is the one verified live (tool calls, tool round trips with reasoning replayed, and strict JSON output all worked; a tiny test costs a fraction of a cent). When tested, the `:free` variant answered HTTP 404 ("unavailable for free"); free variants come and go, so try `--model` first.
 3. `chaos llm-check --provider openrouter --models --match gpt-oss` lists the tool-capable models (OpenRouter has hundreds); `--model <id>` sends one tiny request.
 
-What the adapter does for you: it asks OpenRouter to route only to upstream providers that really support tools and JSON schemas (`require_parameters`), sends a reasoning model's `reasoning` fields back on the next turn, retries per-minute limits, and stops at once on the free tier's **daily** limit with when it resets. Use the plain or `:free` id; the `:batch` listing is meant for asynchronous bulk work, not for an interactive tool loop. This adapter is tested offline; it has not been run live in this repository yet.
+What the adapter does for you: it asks OpenRouter to route only to upstream providers that really support tools and JSON schemas (`require_parameters`), sends a reasoning model's `reasoning` fields back on the next turn, retries per-minute limits, and stops at once on the free tier's **daily** limit with when it resets. Use the plain or `:free` id; the `:batch` listing is meant for asynchronous bulk work, not for an interactive tool loop. It is tested offline and was verified live against `openai/gpt-oss-120b`.
 
 ## Spreading load across models and keys: `provider: pool`
 
@@ -90,14 +90,14 @@ planner:
   members: &llm_members
     - {provider: gemini, model: gemini-3-flash-preview}
     - {provider: gemini, model: gemini-3.5-flash-lite}
-    - {provider: openrouter, model: "openai/gpt-oss-120b:free"}
+    - {provider: openrouter, model: "openai/gpt-oss-120b"}
     - {provider: mistral, model: mistral-small-latest, key_env: MISTRAL_API_KEY_2}   # key_env: use a different key variable for this member
 analyzer:
   provider: pool
   members: *llm_members          # YAML alias: the same list
 ```
 
-- **Rotation.** Each new run (one planner call, or an analysis from its first request) starts on the next member. The position is saved in `results/llm_pool.json`, so successive commands really spread across members.
+- **Rotation.** Each new run (one planner call, or an analysis from its first request) starts on the next member. The position is saved in `results/llm_pool.json`, so successive commands really spread across members. Consecutive runs also prefer a **different provider** from the one that answered before (the planner, the analysis and the report each go to another provider when one is available; with only one provider left it rotates through that provider's models).
 - **Sticky runs.** One analysis stays on its member for every turn, because a tool loop replays provider-specific parts (Gemini's thought signatures).
 - **Failover.** If a member fails (rate limit, spent quota, overload, bad key, unknown model, network) it goes on a cooldown (the API's own "retry in ..." when given, otherwise 2 min for a 429, 1 min for a server error, 1 h for a bad key, 6 h for an unknown model; capped at 24 h) and the same request goes to the next member. The cooldown is saved too, so the next run does not try a member known to be out. A run already under way is never moved into Gemini or Anthropic, and when it moves between providers the history is rebuilt (tool-call ids are mapped to the form each API accepts, and one provider's raw reasoning fields are never replayed to another).
 - **If every member is out,** the planner or analyzer falls back to the heuristic / rules and records each member's reason.

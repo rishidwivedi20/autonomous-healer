@@ -30,6 +30,14 @@ from .llmclient import make_client, model_label
 from .planner import FALLBACK_BETA
 
 MAX_TOOL_OUTPUT_CHARS = 24_000
+TURN_CAP = 80                      # however large the scope, the loop never runs longer than this
+
+
+def effective_turns(cfg: AnalyzerCfg, n_experiments: int) -> int:
+    """Turn budget: `max_turns` covers up to three experiments, plus `turns_per_experiment` for each one beyond that.
+    A model that makes one tool call per turn (gpt-oss does; Gemini batches several) needs about three turns per
+    experiment just to read its data, so a flat budget would cut it off before it could answer."""
+    return min(TURN_CAP, cfg.max_turns + cfg.turns_per_experiment * max(0, n_experiments - 3))
 
 
 class AnalyzerError(Exception):
@@ -48,6 +56,8 @@ network-loss, traffic-spike) and records what happened. Your job: for each exper
 rank the system's weaknesses and propose concrete fixes.
 
 How to work
+- You may request several tools in one turn, and you should: read many experiments with parallel calls instead of one
+  call per turn, because the number of turns is limited.
 - Use the tools to read the stored data. Start with list_experiments and get_graph, then look at each experiment
   (get_experiment, get_metrics, get_gauges, get_container_events as needed). Check the `quality` field of every experiment:
   data recorded by an older build, a failed rollback, or an experiment ended by the kill switch is weaker evidence; say so
@@ -88,7 +98,8 @@ def run_agent(ev: Evidence, ids: list[str], client, cfg: AnalyzerCfg) -> tuple[A
     stats = {"turns": 0, "tool_calls": 0, "rejected": 0, "input_tokens": 0, "output_tokens": 0}
     last_problems: list[str] = []
 
-    for _ in range(cfg.max_turns):
+    limit = effective_turns(cfg, len(ids))
+    for _ in range(limit):
         stats["turns"] += 1
         resp = client.beta.messages.create(
             model=cfg.llm_model, max_tokens=16000, system=SYSTEM, tools=tools, messages=messages,
@@ -139,7 +150,7 @@ def run_agent(ev: Evidence, ids: list[str], client, cfg: AnalyzerCfg) -> tuple[A
                             "content": "REJECTED. Fix these and call submit_analysis again:\n- " + "\n- ".join(problems[:20])})
         messages.append({"role": "user", "content": results})
 
-    raise AnalyzerError(f"no valid analysis within {cfg.max_turns} turns" + (f"; last problems: {'; '.join(last_problems)[:300]}" if last_problems else ""))
+    raise AnalyzerError(f"no valid analysis within {limit} turns" + (f"; last problems: {'; '.join(last_problems)[:300]}" if last_problems else ""))
 
 
 def _by_rules(ev: Evidence, ids: list[str], reason: str | None) -> Analysis:

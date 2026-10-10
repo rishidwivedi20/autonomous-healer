@@ -18,6 +18,7 @@ class FakeContainer:
         self.host = host if host is not None else {}
         self.calls: list = []
         self.update_error = None
+        self.rejects_unlimited_swap = False        # real Docker Desktop did this when lifting a memory cap (see the restore test)
         self.attrs = {}
         self.reload()
 
@@ -38,6 +39,9 @@ class FakeContainer:
         if "cpu_quota" in kw:
             self.host["CpuQuota"] = 0 if kw["cpu_quota"] == -1 else kw["cpu_quota"]
             self.host["CpuPeriod"] = kw["cpu_period"]
+        if self.rejects_unlimited_swap and kw.get("memswap_limit") == -1:
+            raise RuntimeError('500 Server Error: Internal Server Error ("runc did not terminate successfully: exit status 1: '
+                               'memory+swap limit should be >= memory limit")')
         if "mem_limit" in kw:
             ml = kw["mem_limit"]
             ml = 33554432 if ml == "32m" else (16777216 if ml == "16m" else ml)
@@ -192,6 +196,29 @@ def test_memory_restore_never_sends_minus_one_which_docker_rejects(world):
     inj.rollback(h)
     sent = [kw["mem_limit"] for call in redis.calls if isinstance(call, tuple) and call[0] == "update" for kw in [call[1]] if "mem_limit" in kw]
     assert -1 not in sent and 0 not in sent
+
+
+def test_memory_restore_survives_docker_rejecting_unlimited_swap(world):
+    """Seen live: lifting a 32 MB cap with swap=-1 failed with "memory+swap limit should be >= memory limit" and the
+    agent had to stop. The restore now retries with Docker's own default (twice the memory)."""
+    inj, _, redis, *_ = world
+    h = inj.inject("redis", "memory-limit")
+    redis.rejects_unlimited_swap = True
+    assert inj.rollback(h) == []
+    assert redis.host["Memory"] == 4 * 1024 ** 3
+    swaps = [call[1]["memswap_limit"] for call in redis.calls if isinstance(call, tuple) and call[0] == "update" and "memswap_limit" in call[1]]
+    assert swaps[-2:] == [-1, 8 * 1024 ** 3]                         # tried unlimited first, then the finite value that works
+
+
+def test_a_restore_that_fails_both_ways_is_still_reported_not_hidden(world):
+    inj, _, redis, *_, state = world
+    h = inj.inject("redis", "memory-limit")
+    def refuse(**kw):
+        raise RuntimeError("daemon says no")
+    redis.update = refuse
+    errors = inj.rollback(h)
+    assert errors and "daemon says no" in errors[0]
+    assert state.exists()                                              # kept so `chaos abort` can retry
 
 
 def test_memory_restore_failure_is_reported_with_the_recreate_hint(world):

@@ -50,7 +50,7 @@ planner:
   members: &llm_members      # a new run starts on the next member; a member that is out of quota is skipped until it recovers
     - {provider: gemini, model: gemini-3-flash-preview}              # GEMINI_API_KEY; the free tier allows ~20 requests per model per day
     - {provider: gemini, model: gemini-3.5-flash-lite}
-    - {provider: openrouter, model: "openai/gpt-oss-120b:free"}      # OPENROUTER_API_KEY (skipped until the key exists)
+    - {provider: openrouter, model: "openai/gpt-oss-120b"}           # OPENROUTER_API_KEY; paid but cheap (the :free id returned 404 when tested)
     - {provider: mistral, model: mistral-small-latest}               # MISTRAL_API_KEY (needs an active plan)
 
 analyzer:                    # `chaos analyze`: the tool-using agent that explains the stored results
@@ -58,7 +58,8 @@ analyzer:                    # `chaos analyze`: the tool-using agent that explai
   provider: pool             # same choices as the planner; here it shares the planner's member list
   llm_model: gemini-3-flash-preview  # ignored with provider: pool
   llm_effort: medium         # low | medium | high | xhigh | max (Anthropic only)
-  max_turns: 16              # tool-call rounds before the agent is cut off
+  max_turns: 16              # tool-call rounds before the agent is cut off (enough for up to 3 experiments)
+  turns_per_experiment: 4    # extra rounds for each experiment beyond three; models that make one call per turn need them (cap 80)
   max_rejects: 3             # answers rejected for citing numbers the tools never returned, before giving up
   members: *llm_members
 
