@@ -24,9 +24,9 @@ from pydantic import ValidationError
 
 from . import rules
 from .analysis import SUBMIT_TOOL, Analysis, Recorder, validate
-from .config import AnalyzerCfg
+from .config import AnalyzerCfg, llm_label
 from .evidence import TOOLS, Evidence
-from .llmclient import make_client
+from .llmclient import make_client, model_label
 from .planner import FALLBACK_BETA
 
 MAX_TOOL_OUTPUT_CHARS = 24_000
@@ -70,7 +70,7 @@ def _prompt(ids: list[str]) -> str:
 
 
 def _cache_path(cache_dir: Path, cfg: AnalyzerCfg, ids: list[str], fingerprint: str) -> Path:
-    raw = "\x00".join((f"{cfg.provider}:{cfg.llm_model}", cfg.llm_effort, SYSTEM, _prompt(ids), fingerprint,
+    raw = "\x00".join((llm_label(cfg), cfg.llm_effort, SYSTEM, _prompt(ids), fingerprint,
                        json.dumps(SUBMIT_TOOL, sort_keys=True), json.dumps(TOOLS, sort_keys=True)))
     return Path(cache_dir) / f"analysis-{hashlib.sha256(raw.encode()).hexdigest()[:24]}.json"
 
@@ -169,14 +169,15 @@ def analyze(ev: Evidence, ids: list[str], cfg: AnalyzerCfg, use_llm: bool = True
             pass                                                         # corrupt cache entry: ignore it
     try:
         if client is None:
-            client = make_client(cfg.provider)
+            client = make_client(cfg.provider, cfg.members)
         a, stats = run_agent(ev, ids, client, cfg)
+        a.model = model_label(client, a.model)                           # a pool reports the member(s) that really answered
     except AnalyzerError as e:
         return _by_rules(ev, ids, str(e))
     except Exception as e:                                               # no credentials, network, API error, SDK change
         if "authentication method" in str(e):
             return _by_rules(ev, ids, "no Anthropic credentials found (set ANTHROPIC_API_KEY)")
-        return _by_rules(ev, ids, f"{type(e).__name__}: {str(e)[:200]}")
+        return _by_rules(ev, ids, f"{type(e).__name__}: {str(e)[:400]}")
     a.notes.append(f"{stats['turns']} turn(s), {stats['tool_calls']} data-tool call(s), {stats['rejected']} rejected submission(s), "
                    f"{stats['input_tokens']} input / {stats['output_tokens']} output tokens")
     if cache:

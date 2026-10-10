@@ -36,10 +36,14 @@ def test_an_unknown_provider_is_an_error():
         config.AnalyzerCfg(provider="openai", llm_model="gpt")
 
 
-def test_the_repo_config_yaml_loads_with_a_model_that_matches_its_provider():
+def test_the_repo_config_yaml_loads_and_every_model_matches_its_provider():
+    """Loading validates this already (a mismatch is a load-time error); this pins that the shipped file stays loadable."""
     c = config.load(Path(__file__).parent.parent / "config.yaml")
     for section in (c.planner, c.analyzer):
-        assert (section.provider == "gemini") == section.llm_model.startswith("gemini")
+        if section.provider == "pool":
+            assert section.members and all(m.provider in ("anthropic", "gemini", "mistral", "openrouter") for m in section.members)
+        else:
+            assert (section.provider == "gemini") == section.llm_model.startswith("gemini")
 
 
 # ---- .env

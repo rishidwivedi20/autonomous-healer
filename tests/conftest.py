@@ -7,7 +7,7 @@ removed; a test that needs one sets it itself with monkeypatch.
 """
 import pytest
 
-KEY_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "GEMINI_API_KEY", "GOOGLE_API_KEY")
+KEY_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "GEMINI_API_KEY", "GOOGLE_API_KEY", "MISTRAL_API_KEY", "OPENROUTER_API_KEY")
 
 
 @pytest.fixture(autouse=True)

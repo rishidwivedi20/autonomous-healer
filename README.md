@@ -60,6 +60,52 @@ The planner and analyzer can run on Gemini instead of Claude. Nothing else chang
 
 Gemini's suggested fixes are validated for evidence (every number it cites must be one a tool returned) but not for realism: it may propose config keys the app does not read. Treat `change` snippets as suggestions to review.
 
+## Using Mistral instead (La Plateforme key)
+
+A third provider, as a backup for the other two (`chaosai/mistral.py`, same drop-in design: same evidence validator, caches and rule-based fallback).
+
+1. Create a key at https://console.mistral.ai/api-keys and put `MISTRAL_API_KEY=...` in the git-ignored `.env`.
+2. In `config.yaml` set `provider: mistral` and a model (for example `llm_model: mistral-small-latest`) under both `planner:` and `analyzer:`. A model name from another vendor is rejected at load time.
+3. `chaos llm-check --provider mistral --models` lists the chat models with function calling that the key can use; `--model <name>` sends one tiny request.
+
+**A key is not enough: the plan behind it must allow requests.** With a valid key whose plan allowed 0 requests per minute, `--models` worked but every chat call returned HTTP 429 (header `x-ratelimit-limit-req-minute: 0`). The adapter detects that and stops immediately with an instruction instead of retrying: activate the free Experiment plan (or add billing) in the Mistral console. Other 429s are retried with backoff (`Retry-After` is honoured), and any failure falls back to the heuristic planner / rule-based analyzer and records why.
+
+## Using OpenRouter (one key, many models)
+
+A fourth provider (`chaosai/openrouter.py`; it shares the OpenAI-style adapter with Mistral). Model ids look like `vendor/model`, for example `openai/gpt-oss-120b` or its free variant `openai/gpt-oss-120b:free`.
+
+1. Create a key at https://openrouter.ai/keys and put `OPENROUTER_API_KEY=...` in the git-ignored `.env`.
+2. In `config.yaml` set `provider: openrouter` and `llm_model: openai/gpt-oss-120b:free` (or the paid id) under `planner:` and `analyzer:`.
+3. `chaos llm-check --provider openrouter --models --match gpt-oss` lists the tool-capable models (OpenRouter has hundreds); `--model <id>` sends one tiny request.
+
+What the adapter does for you: it asks OpenRouter to route only to upstream providers that really support tools and JSON schemas (`require_parameters`), sends a reasoning model's `reasoning` fields back on the next turn, retries per-minute limits, and stops at once on the free tier's **daily** limit with when it resets. Use the plain or `:free` id; the `:batch` listing is meant for asynchronous bulk work, not for an interactive tool loop. This adapter is tested offline; it has not been run live in this repository yet.
+
+## Spreading load across models and keys: `provider: pool`
+
+Free tiers are small (Gemini: about 20 requests per model per day; OpenRouter's free models have a daily cap; Mistral depends on the plan) and one analysis takes about 10 requests. A pool makes several members behave like one client (`chaosai/pool.py`):
+
+```yaml
+planner:
+  provider: pool
+  members: &llm_members
+    - {provider: gemini, model: gemini-3-flash-preview}
+    - {provider: gemini, model: gemini-3.5-flash-lite}
+    - {provider: openrouter, model: "openai/gpt-oss-120b:free"}
+    - {provider: mistral, model: mistral-small-latest, key_env: MISTRAL_API_KEY_2}   # key_env: use a different key variable for this member
+analyzer:
+  provider: pool
+  members: *llm_members          # YAML alias: the same list
+```
+
+- **Rotation.** Each new run (one planner call, or an analysis from its first request) starts on the next member. The position is saved in `results/llm_pool.json`, so successive commands really spread across members.
+- **Sticky runs.** One analysis stays on its member for every turn, because a tool loop replays provider-specific parts (Gemini's thought signatures).
+- **Failover.** If a member fails (rate limit, spent quota, overload, bad key, unknown model, network) it goes on a cooldown (the API's own "retry in ..." when given, otherwise 2 min for a 429, 1 min for a server error, 1 h for a bad key, 6 h for an unknown model; capped at 24 h) and the same request goes to the next member. The cooldown is saved too, so the next run does not try a member known to be out. A run already under way is never moved into Gemini or Anthropic, and when it moves between providers the history is rebuilt (tool-call ids are mapped to the form each API accepts, and one provider's raw reasoning fields are never replayed to another).
+- **If every member is out,** the planner or analyzer falls back to the heuristic / rules and records each member's reason.
+- **What it does not do.** An analysis that a member returns but our validator rejects repeatedly is not treated as that member failing, so it falls back to the rules instead of trying another member. Several keys only help if they have separate quotas (Gemini's quota is per Google project, not per key); several models of one provider each have their own. Use keys that belong to you or your team.
+- **Reporting.** The plan and the analysis record which member(s) actually answered (for example `gemini:gemini-3-flash-preview`).
+
+`chaos llm-check --provider pool --no-send` shows each member and any saved cooldown without sending anything; without `--no-send` it sends one tiny request per member and reports each.
+
 ## Getting an Anthropic API key
 
 The planner's LLM ranking and the analyzer agent need an API key. Without one everything still works: both fall back to deterministic rules and say so.

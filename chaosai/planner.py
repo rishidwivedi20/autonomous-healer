@@ -25,8 +25,8 @@ from pydantic import BaseModel, Field, ValidationError
 
 from .models import Experiment, ExperimentResult, Graph, Plan, PlannedExperiment, Service
 
-from .config import DEFAULT_FAULTS, PlannerCfg
-from .llmclient import make_client
+from .config import DEFAULT_FAULTS, PlannerCfg, llm_label
+from .llmclient import make_client, model_label
 
 MODEL = "claude-opus-5-5"
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
@@ -303,15 +303,16 @@ def llm_plan(graph: Graph, history: list[dict], n: int = 6, client=None, cache_d
     cands = candidates(graph, history, faults)[:cfg.llm_pool]
     user = _prompt(graph, cands, history, n)
     notes = []
-    cache = _cache_path(cache_dir, f"{cfg.provider}:{cfg.llm_model}|{cfg.llm_effort}", SYSTEM, user) if cache_dir else None
-    text = None
+    cache = _cache_path(cache_dir, f"{llm_label(cfg)}|{cfg.llm_effort}", SYSTEM, user) if cache_dir else None
+    text, answered_by = None, None
     if cache and cache.exists():
-        text = json.loads(cache.read_text(encoding="utf-8"))["text"]
+        saved = json.loads(cache.read_text(encoding="utf-8"))
+        text, answered_by = saved["text"], saved.get("model")      # the model that really produced it, not today's configured default
         notes.append(f"LLM response served from cache ({cache.name}); no API call")
     try:
         if text is None:
             if client is None:
-                client = make_client(cfg.provider)
+                client = make_client(cfg.provider, cfg.members)
             text = _call_model(client, user, cfg.llm_model, cfg.llm_effort)
         experiments = _validate(text, cands, n)
     except PlannerError:
@@ -319,11 +320,12 @@ def llm_plan(graph: Graph, history: list[dict], n: int = 6, client=None, cache_d
     except Exception as e:                                    # no credentials, network, API error, SDK change ...
         if "authentication method" in str(e):
             raise PlannerError("no Anthropic credentials found (set ANTHROPIC_API_KEY)") from e
-        raise PlannerError(f"{type(e).__name__}: {str(e)[:200]}") from e
+        raise PlannerError(f"{type(e).__name__}: {str(e)[:400]}") from e
+    answered_by = answered_by or model_label(client, cfg.llm_model)
     if cache and not cache.exists():                          # only validated responses are cached
         cache.parent.mkdir(parents=True, exist_ok=True)
-        cache.write_text(json.dumps({"model": cfg.llm_model, "text": text}), encoding="utf-8")
-    return Plan(planner="llm", model=cfg.llm_model, created_at=time.time(), notes=notes, experiments=experiments)
+        cache.write_text(json.dumps({"model": answered_by, "text": text}), encoding="utf-8")
+    return Plan(planner="llm", model=answered_by, created_at=time.time(), notes=notes, experiments=experiments)
 
 
 def make_plan(graph: Graph, history: list[dict], n: int = 6, use_llm: bool = True, client=None,

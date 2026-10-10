@@ -9,6 +9,7 @@ empty config.yaml changes nothing. Two rules keep config from becoming a safety 
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -83,15 +84,67 @@ DEFAULT_FAULTS: dict[str, FaultCfg] = {
 }
 
 
-Provider = Literal["anthropic", "gemini"]
+Provider = Literal["anthropic", "gemini", "mistral", "openrouter", "pool"]
+MemberProvider = Literal["anthropic", "gemini", "mistral", "openrouter"]
+_MISTRAL_PREFIXES = ("mistral", "ministral", "magistral", "codestral", "devstral", "pixtral", "open-mistral", "open-mixtral")
+KEY_ENV_PREFIXES = ("ANTHROPIC_", "GEMINI_", "MISTRAL_", "OPENROUTER_")
+
+
+def _vendor_of(model: str) -> str | None:
+    model = model.removeprefix("models/")                  # Gemini accepts this form
+    if "/" in model:                                       # OpenRouter ids are vendor/model, e.g. openai/gpt-oss-120b:free
+        return "openrouter"
+    if model.startswith("claude"):
+        return "anthropic"
+    if model.startswith("gemini"):
+        return "gemini"
+    return "mistral" if model.startswith(_MISTRAL_PREFIXES) else None
 
 
 def _check_model(provider: str, model: str) -> None:
-    """A model name from the other provider would only fail later with a 404, so say so at load time."""
-    if provider == "gemini" and model.startswith("claude"):
-        raise ValueError(f"provider is gemini but llm_model is {model!r}; set a Gemini model (see `chaos llm-check --models`)")
-    if provider == "anthropic" and model.startswith("gemini"):
-        raise ValueError(f"provider is anthropic but llm_model is {model!r}; set a Claude model or switch the provider to gemini")
+    """A model name from another vendor would only fail later with a 404, so say so at load time."""
+    vendor = _vendor_of(model)
+    if vendor is not None and vendor != provider:
+        raise ValueError(f"provider is {provider} but llm_model is {model!r}, which is a {vendor} model; "
+                         f"set a {provider} model (see `chaos llm-check --provider {provider} --models`) or switch the provider to {vendor}")
+    if provider == "openrouter" and "/" not in model:
+        raise ValueError(f"provider is openrouter but llm_model is {model!r}; OpenRouter model ids look like vendor/model, "
+                         "for example openai/gpt-oss-120b:free")
+
+
+class PoolMember(_Base):
+    """One model (and optionally one key) in a `provider: pool` list; see chaosai/pool.py."""
+    provider: MemberProvider
+    model: str
+    key_env: str | None = None            # name of the environment variable holding this member's key (default: the provider's usual one)
+
+    @model_validator(mode="after")
+    def _valid(self):
+        _check_model(self.provider, self.model)
+        if self.key_env is not None and not (re.fullmatch(r"[A-Z][A-Z0-9_]*", self.key_env) and self.key_env.startswith(KEY_ENV_PREFIXES)):
+            raise ValueError(f"key_env {self.key_env!r} must be an environment variable name starting with one of {', '.join(KEY_ENV_PREFIXES)}")
+        return self
+
+
+def pool_label(m: PoolMember) -> str:
+    return f"{m.provider}:{m.model}" + (f"@{m.key_env}" if m.key_env else "")
+
+
+def llm_label(cfg) -> str:
+    """Identifies which model(s) a planner/analyzer section uses; part of the cache key, so changing it never replays an old answer."""
+    if cfg.provider == "pool":
+        return "pool[" + ",".join(pool_label(m) for m in cfg.members) + "]"
+    return f"{cfg.provider}:{cfg.llm_model}"
+
+
+def _check_provider_settings(cfg) -> None:
+    if cfg.provider == "pool":
+        if not cfg.members:
+            raise ValueError("provider is pool but `members` is empty; list at least one {provider, model} member")
+        return
+    if cfg.members:
+        raise ValueError("`members` is only used with provider: pool")
+    _check_model(cfg.provider, cfg.llm_model)
 
 
 class PlannerCfg(_Base):
@@ -99,28 +152,30 @@ class PlannerCfg(_Base):
     max_per_target: int = Field(2, ge=1)
     max_per_fault: int = Field(3, ge=1)
     use_llm: bool = True
-    provider: Provider = "anthropic"      # anthropic (ANTHROPIC_API_KEY) | gemini (GEMINI_API_KEY, Google AI Studio)
-    llm_model: str = "claude-opus-5-5"
+    provider: Provider = "anthropic"      # anthropic | gemini | mistral | openrouter (one key each), or pool (see `members`)
+    llm_model: str = "claude-opus-5-5"    # ignored with provider: pool
     llm_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"     # Anthropic only
-    llm_pool: int = Field(14, ge=1)
+    llm_pool: int = Field(14, ge=1)       # how many top candidates the LLM may choose from
+    members: list[PoolMember] = Field(default_factory=list)                      # for provider: pool
 
     @model_validator(mode="after")
     def _model_matches_provider(self):
-        _check_model(self.provider, self.llm_model)
+        _check_provider_settings(self)
         return self
 
 
 class AnalyzerCfg(_Base):
     use_llm: bool = True                 # needs a key for `provider`; falls back to the rule-based analyzer if unavailable
-    provider: Provider = "anthropic"     # anthropic (ANTHROPIC_API_KEY) | gemini (GEMINI_API_KEY, Google AI Studio)
-    llm_model: str = "claude-opus-5-5"
+    provider: Provider = "anthropic"     # anthropic | gemini | mistral | openrouter (one key each), or pool (see `members`)
+    llm_model: str = "claude-opus-5-5"   # ignored with provider: pool
     llm_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"     # Anthropic only
     max_turns: int = Field(16, ge=2)     # tool-call rounds before the agent is cut off
     max_rejects: int = Field(3, ge=0)    # answers rejected for citing numbers the tools never returned, before giving up
+    members: list[PoolMember] = Field(default_factory=list)                      # for provider: pool
 
     @model_validator(mode="after")
     def _model_matches_provider(self):
-        _check_model(self.provider, self.llm_model)
+        _check_provider_settings(self)
         return self
 
 

@@ -43,9 +43,10 @@ _SCHEMA_KEYS = {"type", "format", "description", "nullable", "enum", "properties
 
 
 class GeminiError(Exception):
-    def __init__(self, message: str, status: Optional[int] = None):
+    def __init__(self, message: str, status: Optional[int] = None, retry_after_s: Optional[float] = None):
         super().__init__(message)
         self.status = status
+        self.retry_after_s = retry_after_s       # how long a caller should leave this model alone, when known
 
 
 def api_key() -> Optional[str]:
@@ -96,6 +97,11 @@ class GeminiClient:
 
     # ------------------------------------------------------------ request
     def _contents(self, messages: list[dict]) -> list[dict]:
+        for m in messages:                          # function names come from the history, so tool calls another provider issued work too
+            if m["role"] == "assistant" and not isinstance(m["content"], str):
+                for b in m["content"]:
+                    if _get(b, "type") == "tool_use":
+                        self._names[_get(b, "id")] = _get(b, "name")
         out = []
         for m in messages:
             role, content = "model" if m["role"] == "assistant" else "user", m["content"]
@@ -164,7 +170,7 @@ class GeminiClient:
         return min(2.0 ** (attempt + 1), MAX_BACKOFF_S)
 
     @staticmethod
-    def _quota_exhausted(r: httpx.Response) -> Optional[str]:
+    def _quota_exhausted(r: httpx.Response) -> Optional[GeminiError]:
         """A 429 whose suggested wait is longer than we would ever sleep is a spent quota (e.g. the free tier's
         daily request limit), not a burst: retrying is pointless, so say what ran out and when it resets."""
         m = re.search(r'"retryDelay":\s*"([\d.]+)s"', r.text)
@@ -173,8 +179,9 @@ class GeminiClient:
         qid = re.search(r'"quotaId":\s*"([^"]+)"', r.text)
         qv = re.search(r'"quotaValue":\s*"?(\d+)', r.text)
         qm = re.search(r'"model":\s*"([^"]+)"', r.text)
-        return ("quota exhausted (" + (qid.group(1) if qid else "unknown quota") + (f", limit {qv.group(1)}" if qv else "") + ")"
-                + (f" for model {qm.group(1)}" if qm else "") + f"; resets in about {float(m.group(1)) / 3600:.1f} h")
+        secs = float(m.group(1))
+        return GeminiError("quota exhausted (" + (qid.group(1) if qid else "unknown quota") + (f", limit {qv.group(1)}" if qv else "") + ")"
+                           + (f" for model {qm.group(1)}" if qm else "") + f"; resets in about {secs / 3600:.1f} h", 429, secs)
 
     def _post(self, model: str, body: dict) -> dict:
         url = f"{BASE_URL}/models/{model.removeprefix('models/')}:generateContent"
@@ -187,12 +194,12 @@ class GeminiClient:
                 if attempt < self.max_retries:
                     self._sleep(min(2.0 ** (attempt + 1), MAX_BACKOFF_S))
                     continue
-                raise GeminiError(f"cannot reach the Gemini API ({type(e).__name__})") from None
+                raise GeminiError(f"cannot reach the Gemini API ({type(e).__name__})", retry_after_s=60) from None
             if r.status_code == 200:
                 return r.json()
             spent = self._quota_exhausted(r)
             if spent:
-                raise GeminiError(spent, 429)
+                raise spent
             if r.status_code in RETRY_STATUSES and attempt < self.max_retries:
                 self._sleep(self._delay(r, attempt))
                 continue

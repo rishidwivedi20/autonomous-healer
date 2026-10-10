@@ -43,18 +43,24 @@ planner:
   max_per_target: 2          # variety caps
   max_per_fault: 3
   use_llm: true              # needs the key for `provider`; falls back to the heuristic if unavailable
-  provider: gemini           # anthropic (ANTHROPIC_API_KEY) | gemini (GEMINI_API_KEY from Google AI Studio)
-  llm_model: gemini-3.5-flash-lite
-  llm_effort: medium         # low | medium | high | xhigh | max
+  provider: pool             # anthropic | gemini | mistral | openrouter (one key each), or pool: rotate across `members` and fail over
+  llm_model: gemini-3.5-flash-lite   # ignored with provider: pool
+  llm_effort: medium         # low | medium | high | xhigh | max (Anthropic only)
   llm_pool: 14               # how many top candidates the LLM may choose from
+  members: &llm_members      # a new run starts on the next member; a member that is out of quota is skipped until it recovers
+    - {provider: gemini, model: gemini-3-flash-preview}              # GEMINI_API_KEY; the free tier allows ~20 requests per model per day
+    - {provider: gemini, model: gemini-3.5-flash-lite}
+    - {provider: openrouter, model: "openai/gpt-oss-120b:free"}      # OPENROUTER_API_KEY (skipped until the key exists)
+    - {provider: mistral, model: mistral-small-latest}               # MISTRAL_API_KEY (needs an active plan)
 
 analyzer:                    # `chaos analyze`: the tool-using agent that explains the stored results
   use_llm: true              # needs the key for `provider`; falls back to the deterministic rule-based analyzer
-  provider: gemini           # anthropic (ANTHROPIC_API_KEY) | gemini (GEMINI_API_KEY from Google AI Studio)
-  llm_model: gemini-3-flash-preview
-  llm_effort: medium         # low | medium | high | xhigh | max
+  provider: pool             # same choices as the planner; here it shares the planner's member list
+  llm_model: gemini-3-flash-preview  # ignored with provider: pool
+  llm_effort: medium         # low | medium | high | xhigh | max (Anthropic only)
   max_turns: 16              # tool-call rounds before the agent is cut off
   max_rejects: 3             # answers rejected for citing numbers the tools never returned, before giving up
+  members: *llm_members
 
 dashboard:                   # `chaos dashboard`: live web page with an inject button
   port: 8765

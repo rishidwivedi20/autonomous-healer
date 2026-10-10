@@ -167,16 +167,23 @@ def make_plan(c: config_mod.Config, top: int | None, offline: bool, compose: Pat
 # ------------------------------------------------------------------ llm-check
 @app.command("llm-check")
 def llm_check(send: bool = typer.Option(True, help="--no-send only checks that a key is configured"),
-              provider: str = typer.Option(None, help="anthropic | gemini (default: analyzer.provider)"),
-              models: bool = typer.Option(False, "--models", help="gemini: list the models this key can call"),
-              model: str = typer.Option(None, "--model", help="gemini: model to test (default: analyzer.llm_model, else gemini-3.8-flash)")):
+              provider: str = typer.Option(None, help="anthropic | gemini | mistral | openrouter | pool (default: analyzer.provider)"),
+              models: bool = typer.Option(False, "--models", help="gemini / mistral / openrouter: list the models this key can use"),
+              model: str = typer.Option(None, "--model", help="gemini / mistral / openrouter: model to test (default: analyzer.llm_model when it matches the provider)"),
+              match: str = typer.Option(None, "--match", help="with --models: only names containing this text (OpenRouter lists hundreds)")):
     """Check the LLM key: is one configured, and does one tiny request work? (Costs a fraction of a cent or nothing.)"""
     c = cfg()
     provider = provider or c.analyzer.provider
     if provider == "gemini":
-        return llm_check_gemini(c, send, models, model)
+        return llm_check_gemini(c, send, models, model, match)
+    if provider == "mistral":
+        return llm_check_mistral(c, send, models, model, match)
+    if provider == "openrouter":
+        return llm_check_openrouter(c, send, models, model, match)
+    if provider == "pool":
+        return llm_check_pool(c, send)
     if provider != "anthropic":
-        fail(f"unknown provider {provider!r}; use anthropic or gemini")
+        fail(f"unknown provider {provider!r}; use anthropic, gemini, mistral, openrouter or pool")
     key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
     if not key:
         fail("no key found. Set ANTHROPIC_API_KEY (see README: 'Getting an Anthropic API key') or put it in .env", 1)
@@ -203,7 +210,7 @@ def llm_check(send: bool = typer.Option(True, help="--no-send only checks that a
                f"tokens in={resp.usage.input_tokens} out={resp.usage.output_tokens}")
 
 
-def llm_check_gemini(c: config_mod.Config, send: bool, list_models: bool, model: str | None = None) -> None:
+def llm_check_gemini(c: config_mod.Config, send: bool, list_models: bool, model: str | None = None, match: str | None = None) -> None:
     from .gemini import GeminiClient, GeminiError, api_key
     key = api_key()
     if not key:
@@ -215,7 +222,7 @@ def llm_check_gemini(c: config_mod.Config, send: bool, list_models: bool, model:
     try:
         client = GeminiClient()
         if list_models:
-            names = client.list_models()
+            names = [n for n in client.list_models() if not match or match.lower() in n.lower()]
             typer.echo(f"{len(names)} model(s) this key can call:\n  " + "\n  ".join(names))
         if not send:
             return
@@ -230,6 +237,87 @@ def llm_check_gemini(c: config_mod.Config, send: bool, list_models: bool, model:
     text = next((b.text for b in resp.content if getattr(b, "type", None) == "text"), "")
     typer.echo(f"OK: {model} answered {text.strip()!r}; stop_reason={resp.stop_reason}; "
                f"tokens in={resp.usage.input_tokens} out={resp.usage.output_tokens}")
+
+
+def llm_check_mistral(c: config_mod.Config, send: bool, list_models: bool, model: str | None = None, match: str | None = None) -> None:
+    from .mistral import MistralClient, MistralError, api_key
+    key = api_key()
+    if not key:
+        fail("no Mistral key found. Create one at https://console.mistral.ai/api-keys and put MISTRAL_API_KEY=... in .env", 1)
+    typer.echo(f"key found: {mask(key)}  (provider in config: planner={c.planner.provider}, analyzer={c.analyzer.provider})")
+    if not send and not list_models:
+        return
+    try:
+        client = MistralClient()
+        if list_models:
+            names = [n for n in client.list_models() if not match or match.lower() in n.lower()]
+            typer.echo(f"{len(names)} chat model(s) with function calling this key can use:\n  " + "\n  ".join(names))
+        if not send:
+            return
+        model = model or (c.analyzer.llm_model if c.analyzer.provider == "mistral" else "mistral-small-latest")
+        resp = client.messages.create(model=model, max_tokens=64, messages=[{"role": "user", "content": "Reply with the single word: ok"}])
+    except MistralError as e:
+        hint = {400: "  (check the model name: try --models)", 401: "  (the key was rejected: check it is copied completely and not revoked)",
+                403: "  (the key is valid but not allowed to use this model)", 404: "  (that model name does not exist: try --models)",
+                429: "  (rate limited; the free Experiment tier has low limits, wait and retry)"}.get(e.status or 0, "")
+        if "0 requests per minute" in str(e):               # waiting cannot help; the message already says what to do
+            hint = ""
+        fail(f"Mistral error: {e}{hint}", 1)
+    text = next((b.text for b in resp.content if getattr(b, "type", None) == "text"), "")
+    typer.echo(f"OK: {model} answered {text.strip()!r}; stop_reason={resp.stop_reason}; "
+               f"tokens in={resp.usage.input_tokens} out={resp.usage.output_tokens}")
+
+
+def llm_check_openrouter(c: config_mod.Config, send: bool, list_models: bool, model: str | None = None, match: str | None = None) -> None:
+    from .openrouter import OpenRouterClient, OpenRouterError, api_key
+    key = api_key()
+    if not key:
+        fail("no OpenRouter key found. Create one at https://openrouter.ai/keys and put OPENROUTER_API_KEY=... in .env", 1)
+    typer.echo(f"key found: {mask(key)}  (provider in config: planner={c.planner.provider}, analyzer={c.analyzer.provider})")
+    if not send and not list_models:
+        return
+    try:
+        client = OpenRouterClient()
+        if list_models:
+            names = [n for n in client.list_models() if not match or match.lower() in n.lower()]
+            shown = names[:200]
+            typer.echo(f"{len(names)} model(s) that support tools" + (f" matching {match!r}" if match else "") + ":\n  " + "\n  ".join(shown)
+                       + (f"\n  ... and {len(names) - len(shown)} more (narrow with --match)" if len(names) > len(shown) else ""))
+        if not send:
+            return
+        model = model or (c.analyzer.llm_model if c.analyzer.provider == "openrouter" else "openai/gpt-oss-120b:free")
+        resp = client.messages.create(model=model, max_tokens=256, messages=[{"role": "user", "content": "Reply with the single word: ok"}])
+    except OpenRouterError as e:
+        hint = {401: "  (the key was rejected: check it is copied completely and not revoked)",
+                402: "  (this model needs credits: add some on openrouter.ai, or use a :free model)",
+                404: "  (no such model, or no provider supports tools/JSON for it: try --models --match <text>)",
+                429: "  (rate limited; free models have per-minute and daily limits)"}.get(e.status or 0, "")
+        fail(f"OpenRouter error: {e}{hint}", 1)
+    text = next((b.text for b in resp.content if getattr(b, "type", None) == "text"), "")
+    typer.echo(f"OK: {model} answered {text.strip()!r}; stop_reason={resp.stop_reason}; "
+               f"tokens in={resp.usage.input_tokens} out={resp.usage.output_tokens}")
+
+
+def llm_check_pool(c: config_mod.Config, send: bool) -> None:
+    from .pool import PoolClient, PoolError
+    members = c.analyzer.members if c.analyzer.provider == "pool" else c.planner.members
+    if not members:
+        fail("no pool configured: set `provider: pool` and a `members:` list under analyzer: (and planner:) in config.yaml", 1)
+    try:
+        pool = PoolClient(members, state_path=RESULTS / "llm_pool.json")
+    except PoolError as e:
+        fail(str(e), 1)
+    typer.echo(f"{len(members)} pool member(s):")
+    for label, left, reason in pool.status():
+        typer.echo(f"  {label}: " + (f"on cooldown for about {left / 60:.0f} more min ({reason})" if left > 0 else "available"))
+    if not send:
+        return
+    typer.echo("\none tiny request per member (this spends one request of each member's quota):")
+    results = pool.check()
+    for label, worked, detail in results:
+        typer.echo(f"  {'OK  ' if worked else 'FAIL'} {label}: {detail}")
+    if not any(w for _, w, _ in results):
+        fail("no pool member answered", 1)
 
 
 # ------------------------------------------------------------------ config

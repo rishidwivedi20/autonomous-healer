@@ -1,7 +1,7 @@
 """Tiny `.env` loader so the Anthropic key can live in a git-ignored file instead of being retyped.
 
 Safety rules: it never overrides a variable that is already set, it only accepts names starting with
-ANTHROPIC_, GEMINI_ or CHAOSAI_ (a stray `.env` line must not be able to change PATH or similar), and it never
+ANTHROPIC_, GEMINI_, MISTRAL_, OPENROUTER_ or CHAOSAI_ (a stray `.env` line must not be able to change PATH or similar), and it never
 prints a value. `.env` is listed in .gitignore.
 """
 from __future__ import annotations
@@ -10,7 +10,7 @@ import os
 import re
 from pathlib import Path
 
-ALLOWED_PREFIXES = ("ANTHROPIC_", "GEMINI_", "CHAOSAI_")
+ALLOWED_PREFIXES = ("ANTHROPIC_", "GEMINI_", "MISTRAL_", "OPENROUTER_", "CHAOSAI_")
 _NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 ROOT = Path(__file__).resolve().parent.parent
 
