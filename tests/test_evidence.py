@@ -226,3 +226,21 @@ def test_percentile_labels_are_names_not_cited_values(seen):
     assert claim_numbers(a.weaknesses[0].evidence[0].claim, IDS) == [54.0]
     assert validate(a, seen, IDS, HYP) == [] or all("[95.0]" not in p and "[50.0]" not in p for p in validate(a, seen, IDS, HYP))
     assert 95.0 not in numbers_in({"hypothesis": "vote p95 rises"})
+
+
+def test_restarts_are_recomputed_from_events_so_old_negative_counts_are_corrected(tmp_path):
+    d = make_results(tmp_path)
+    p = d / f"{KILL_ID}.json"
+    p.write_text(p.read_text().replace('"db": 1,', '"db": -20,'))              # a result stored by the buggy build
+    e = Evidence(d)
+    assert e.get_experiment(KILL_ID)["restarts"] == {"db": 1, "result": 1, "worker": 1}   # from the events table
+    assert e.get_container_events(KILL_ID)["restarts"] == {"db": 1, "result": 1, "worker": 1}
+
+
+def test_unreadable_queue_readings_are_reported(tmp_path):
+    d = make_results(tmp_path)
+    from chaosai.observer import Store
+    s = Store(d / "chaosai.db")
+    s.execute("INSERT INTO gauges VALUES (?,?,?)", (1_000_005.5, "redis_queue_len", None))     # redis paused: exec failed
+    s.close()
+    assert Evidence(d).get_gauges(SPIKE_ID)["summary"]["queue_unreadable_readings"] == 1

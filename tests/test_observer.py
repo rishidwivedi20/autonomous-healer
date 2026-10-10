@@ -262,3 +262,23 @@ def test_worst_window_is_not_diluted_by_a_healthy_journey(store):
 
 def test_worst_window_empty(store):
     assert worst_window(store, 0, 10).n == 0
+
+
+# ---- restart counting must survive Docker resetting RestartCount on a manual start
+def test_restart_count_reset_after_a_manual_stop_is_not_negative(store):
+    """Real case: db restart_count was 20, the `stop` fault ended with a manual start, Docker reset it to 0."""
+    for t, v in [(1, "20"), (40, "0")]:
+        store.execute("INSERT INTO events VALUES (?,?,?,?)", (t, "db", "restart_count", v))
+    assert restart_counts(store, 10, 60) == {}
+
+
+def test_restarts_after_a_reset_are_still_counted(store):
+    for t, v in [(1, "20"), (40, "0"), (45, "1"), (50, "2")]:      # reset, then two real automatic restarts
+        store.execute("INSERT INTO events VALUES (?,?,?,?)", (t, "db", "restart_count", v))
+    assert restart_counts(store, 10, 60) == {"db": 2}
+
+
+def test_increases_before_and_after_a_reset_are_summed(store):
+    for t, v in [(1, "5"), (20, "7"), (30, "0"), (35, "3")]:
+        store.execute("INSERT INTO events VALUES (?,?,?,?)", (t, "db", "restart_count", v))
+    assert restart_counts(store, 10, 60) == {"db": 2 + 3}

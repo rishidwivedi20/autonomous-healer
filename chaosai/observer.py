@@ -153,19 +153,28 @@ def gauge_series(store: Store, name: str, start: float, end: float) -> list[tupl
 
 
 def restart_counts(store: Store, start: float, end: float) -> dict[str, int]:
-    """Restarts observed in [start, end]: highest restart_count minus the one in force at start."""
+    """Automatic restarts observed in [start, end].
+
+    Docker resets RestartCount to 0 when a container is started again after a manual stop (seen live:
+    db 20 -> 0), so this sums only the INCREASES between consecutive readings; a decrease is a reset and
+    counting resumes from the new value. (Taking last minus first went negative for `stop` faults.)"""
     out: dict[str, int] = {}
     for (svc,) in store.query("SELECT DISTINCT service FROM events WHERE kind='restart_count'"):
         before = store.query(
             "SELECT value FROM events WHERE service=? AND kind='restart_count' AND t < ? ORDER BY t DESC LIMIT 1",
             (svc, start))
         inside = store.query(
-            "SELECT value FROM events WHERE service=? AND kind='restart_count' AND t >= ? AND t <= ?",
+            "SELECT value FROM events WHERE service=? AND kind='restart_count' AND t >= ? AND t <= ? ORDER BY t",
             (svc, start, end))
-        base = int(before[0][0]) if before else (int(inside[0][0]) if inside else 0)
-        peak = max((int(v) for (v,) in inside), default=base)
-        if peak - base:
-            out[svc] = peak - base
+        prev = int(before[0][0]) if before else None
+        total = 0
+        for (v,) in inside:
+            v = int(v)
+            if prev is not None and v > prev:
+                total += v - prev
+            prev = v                                   # a drop is a reset: continue from the new value
+        if total:
+            out[svc] = total
     return out
 
 

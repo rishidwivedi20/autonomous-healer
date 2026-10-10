@@ -18,7 +18,7 @@ from pathlib import Path
 from statistics import median
 
 from .models import ExperimentResult, Graph
-from .observer import Store, percentile
+from .observer import Store, percentile, restart_counts
 
 WINDOWS = ("around", "baseline", "during", "recovery")
 JOURNEYS = ("vote", "result")
@@ -135,6 +135,13 @@ class Evidence:
              "recovered": r.recovered, "data_quality_issues": len(self._quality(r))}
             for i, r in self._exps.items()]}
 
+    def _restarts(self, r: ExperimentResult) -> dict:
+        """Automatic restarts, recomputed from the stored events so results written before the reset-aware
+        counting (negative counts after a `stop`) are corrected; falls back to the stored value."""
+        if self.store is None:
+            return r.restarts
+        return restart_counts(self.store, r.started_at, r.ended_at)
+
     def _quality(self, r: ExperimentResult) -> list[str]:
         q = []
         if not r.during_by_journey:
@@ -161,7 +168,7 @@ class Evidence:
             "recovered": r.recovered, "recovery_s": _r(r.recovery_s),
             "recovery_probe_s": _r(r.recovery_probe_s), "recovery_pipeline_s": _r(r.recovery_pipeline_s),
             "pipeline_assessed": r.pipeline_assessed,
-            "restarts": r.restarts, "rollback_errors": r.rollback_errors, "notes": r.notes,
+            "restarts": self._restarts(r), "rollback_errors": r.rollback_errors, "notes": r.notes,
             "baseline_by_journey": _jstats(r.baseline_by_journey), "during_by_journey": _jstats(r.during_by_journey),
             "overall": {"baseline": {"n": r.baseline.n, "error_pct": _pct(r.baseline.error_rate), "p95_ms": _r(r.baseline.p95_ms)},
                         "during": {"n": r.during.n, "error_pct": _pct(r.during.error_rate), "p95_ms": _r(r.during.p95_ms)}},
@@ -245,6 +252,7 @@ class Evidence:
                 "votes_per_s_while_draining": draining,
                 "peak_backlog_lag_s": round(peak / draining, 1) if peak and draining and draining > 0 else None,
                 "db_unreadable_readings": sum(1 for t, v in d if v is None and t >= 0),
+                "queue_unreadable_readings": sum(1 for t, v in q if v is None and t >= 0),
                 "gauge_readings": len(q)},
             "rows": rows}
 
@@ -266,7 +274,7 @@ class Evidence:
                 continue                                    # the watcher's start-up snapshot is not a state change
             out.append({"t_s": round(t - t0, 1), "service": svc, "kind": kind, "value": val})
         return {"experiment_id": experiment_id, "t_s_means": "seconds since the fault was applied",
-                "restarts": r.restarts, "events": out}
+                "restarts": self._restarts(r), "events": out}
 
     def get_graph(self) -> dict:
         p = self.dir / "graph.json"

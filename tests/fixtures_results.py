@@ -43,6 +43,9 @@ def make_results(tmp_path: Path) -> Path:
     ev(T_SPIKE - 100, "vote", "health", "starting")
     ev(T_KILL - 1, "db", "state", "running")                            # watcher start-up snapshot: same value again
     ev(T_KILL + 1, "db", "restart_count", "3")
+    for svc in ("result", "worker"):                                  # the cascade the stored result also records
+        ev(T_KILL - 100, svc, "restart_count", "0")
+        ev(T_KILL + 1, svc, "restart_count", "1")
     ev(T_KILL + 1, "db", "health", "starting")
     ev(T_SPIKE + 3, "vote", "health", "healthy")
 
