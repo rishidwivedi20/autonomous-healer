@@ -15,3 +15,4 @@ def _hermetic_llm_environment(monkeypatch, tmp_path_factory):
     monkeypatch.setenv("CHAOSAI_CONFIG", str(tmp_path_factory.getbasetemp() / "no-such-config.yaml"))
     for var in KEY_VARS:
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv("CHAOSAI_NO_DOTENV", raising=False)       # the acceptance run sets it for its subprocesses; a test must not inherit it

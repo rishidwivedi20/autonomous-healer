@@ -18,6 +18,8 @@ class FakeContainer:
         self.host = host if host is not None else {}
         self.calls: list = []
         self.update_error = None
+        self.race_on = None                        # "unpause" / "start": another process wins the race, then this call fails like Docker's
+        self.broken = set()                        # actions that fail and change nothing
         self.rejects_unlimited_swap = False        # real Docker Desktop did this when lifting a memory cap (see the restore test)
         self.attrs = {}
         self.reload()
@@ -27,9 +29,18 @@ class FakeContainer:
 
     def kill(self): self.calls.append("kill"); self.status = "exited"
     def stop(self, timeout=10): self.calls.append("stop"); self.status = "exited"
-    def start(self): self.calls.append("start"); self.status = "running"
+    def _act(self, action, status):
+        self.calls.append(action)
+        if action in self.broken:
+            raise RuntimeError(f'500 Server Error: {action} failed')
+        if self.race_on == action:
+            self.status, self.race_on = "running", None
+            raise RuntimeError(f'500 Server Error: Internal Server Error ("Container {self.name} is not {"paused" if action == "unpause" else "stopped"}")')
+        self.status = status
+
+    def start(self): self._act("start", "running")
     def pause(self): self.calls.append("pause"); self.status = "paused"
-    def unpause(self): self.calls.append("unpause"); self.status = "running"
+    def unpause(self): self._act("unpause", "running")
 
     def update(self, **kw):
         self.calls.append(("update", kw))
@@ -356,3 +367,43 @@ def test_dry_run_touches_nothing(tmp_path):
     assert c.calls == [] and h.dry_run and "dry-run" in h.actions[0]
     assert not (tmp_path / "f.json").exists()
     assert inj.rollback(h) == []
+
+
+# ---- two processes undoing the same fault at once (the running experiment's rollback and a `chaos abort`)
+def test_rollback_of_a_pause_survives_someone_else_unpausing_first(world):
+    """Seen in the acceptance run: the kill switch makes the experiment roll back while `chaos abort` unpauses the same container;
+    the loser got Docker's 'is not paused' and abort reported a failure although everything was restored."""
+    inj, _, redis, *_ = world
+    h = inj.inject("redis", "pause")
+    redis.race_on = "unpause"
+    assert inj.rollback(h) == [] and redis.status == "running"
+
+
+def test_restore_all_survives_the_same_race(world):
+    inj, _, redis, *_, state = world
+    inj.inject("redis", "pause")
+    redis.race_on = "unpause"
+    assert inj.restore_all() == [] and redis.status == "running" and not state.exists()
+
+
+def test_starting_a_stopped_container_survives_someone_else_starting_it_first(world):
+    inj, _, redis, *_ = world
+    h = inj.inject("redis", "stop")
+    redis.race_on = "start"
+    assert inj.rollback(h) == [] and redis.status == "running"
+
+
+def test_a_real_unpause_failure_is_still_reported(world):
+    inj, _, redis, *_ = world
+    h = inj.inject("redis", "pause")
+    redis.broken.add("unpause")
+    errors = inj.rollback(h)
+    assert errors and "unpause failed" in errors[0] and redis.status == "paused"
+
+
+def test_a_real_start_failure_is_still_reported_by_restore_all(world):
+    inj, _, redis, *_ = world
+    inj.inject("redis", "stop")
+    redis.broken.add("start")
+    errors = inj.restore_all()
+    assert errors and any("start failed" in e for e in errors) and redis.status == "exited"

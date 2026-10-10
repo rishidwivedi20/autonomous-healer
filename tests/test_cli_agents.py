@@ -274,3 +274,37 @@ def test_a_fix_that_stopped_or_failed_to_revert_fails_the_pipeline(results, monk
     fake_live(monkeypatch, FakeFixer(results, improved_run(status="error", reverted=False, revert_errors=["boom"])))
     r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes"])
     assert r.exit_code == 1 and "NOT reverted: boom" in r.output
+
+
+# ---------------------------------------------------------------- nothing names a fixable weakness: the pipeline measures instead of guessing
+def test_when_no_finding_or_history_names_a_fix_the_pipeline_probes_the_catalogue(results, monkeypatch):
+    (results / f"{SPIKE_ID}.json").unlink()                          # no backlog evidence anywhere in the stored history
+    fake_injector(monkeypatch, [KILL_ID])
+    f = FakeFixer(results)
+    fake_live(monkeypatch, f)
+    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--top", "2"])
+    assert r.exit_code == 0, r.output
+    assert f.calls == [("scale-worker", "", None)]                    # asked to probe, with no weakness named
+    assert "no finding names it, so the agent measures whether the problem exists; it changes nothing unless it does" in r.output
+    assert "fixing: Run three worker replicas" in r.output
+    assert "addresses:" not in r.output.split("AGENT 3/3: FIXING")[1].split("FIX scale-worker")[0]
+    assert "fixing:    scale-worker ->" in r.output
+
+
+def test_a_probe_that_does_not_reproduce_the_problem_is_reported_as_skipped_with_no_change(results, monkeypatch):
+    (results / f"{SPIKE_ID}.json").unlink()
+    fake_injector(monkeypatch, [KILL_ID])
+    skipped = improved_run(status="skipped", reverted=False).model_copy(update={
+        "detail": "the problem was not reproduced: redis queue peak was 2 (needs at least 20), so no change was made", "comparison": [], "claim": "", "after": None})
+    fake_live(monkeypatch, FakeFixer(results, skipped))
+    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--top", "2"])
+    assert r.exit_code == 0 and "FIX scale-worker: SKIPPED" in r.output
+    assert "fixing:    scale-worker -> skipped: the problem was not reproduced" in r.output and "NOT reverted" not in r.output
+
+
+def test_a_finding_that_names_a_fix_is_used_instead_of_probing(results, monkeypatch):
+    fake_injector(monkeypatch, [SPIKE_ID])
+    f = FakeFixer(results)
+    fake_live(monkeypatch, f)
+    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--top", "2"])
+    assert f.calls[0][1].startswith("Single worker") and "no finding names it" not in r.output

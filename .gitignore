@@ -6,3 +6,4 @@ results/*
 !results/.gitkeep
 *.db
 .env
+results-acceptance/

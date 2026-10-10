@@ -239,6 +239,9 @@ class App:
             return 400, {"error": "target and fault are required strings"}
         if fault not in self.cfg.faults:
             return 400, {"error": f"unknown fault {fault!r}"}
+        guard = getattr(self.runner.orch, "guard", None)
+        if guard is not None and target not in guard.managed_targets:       # refuse up front; the guard would refuse it later anyway
+            return 400, {"error": f"{target!r} is not a managed service (label chaosai.managed=true); allowed: {', '.join(sorted(guard.managed_targets))}"}
         if self.kill.engaged:
             return 409, {"error": "kill switch is engaged; press Reset first"}
         params = {**self.cfg.faults[fault].params, **(body.get("params") or {})}

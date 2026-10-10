@@ -2,7 +2,7 @@
 
 Inject failures into a small microservices app (Docker's example-voting-app), observe the real impact, then (Day 2) have an AI agent diagnose what broke from stored evidence and recommend cited fixes. See [PLAN.md](PLAN.md).
 
-**Status: Day 1 complete and verified on real Docker Desktop (305 unit tests; baseline, redis crash, auto-abort, mid-run kill switch and the injector agent all exercised live).**
+**Status: three agents (injecting, finding, fixing) built and verified on real Docker Desktop with no API key: eight fault types, safety layer (auto-abort, kill switch, lock), resilience score, findings report, live dashboard, and a fixing agent that proves a fix with the same experiment before and after. Run `python scripts/acceptance.py` for the full acceptance checklist (about 30 minutes; the unit tests need no Docker).**
 
 ## Reproduce from scratch (Windows, PowerShell)
 
@@ -11,7 +11,7 @@ Prerequisite: Docker Desktop running (WSL2 backend), Python 3.11+.
 ```powershell
 git clone https://github.com/rishidwivedi20/autonomous-healer.git chaos-ai; cd chaos-ai
 python -m venv .venv; .\.venv\Scripts\pip install -r requirements.txt
-.\.venv\Scripts\python -m pytest -q                 # 190 tests, no Docker needed
+.\.venv\Scripts\python -m pytest -q                 # the unit tests, no Docker needed
 .\deploy\tasks.ps1 up                               # vote :8080, result :8081, waits until healthy
 .\chaos.cmd discover                                    # dependency map -> results\graph.json (+ Mermaid)
 .\chaos.cmd baseline --seconds 120                      # steady-state p50/p95/error rate -> results\baseline.json
@@ -23,13 +23,21 @@ python -m venv .venv; .\.venv\Scripts\pip install -r requirements.txt
 
 (`chaos.cmd` is a wrapper for `python -m chaosai`. In PowerShell type the full `.\chaos.cmd`; plain `.\chaos` is not found. In git-bash use `./chaos`.)
 
+## Acceptance run (everything, from scratch, no API key)
+
+```powershell
+.\.venv\Scripts\python scripts\acceptance.py --results results-acceptance
+```
+
+It strips every API key from the environment and ignores `.env` (`CHAOSAI_NO_DOTENV=1`), so nothing in it can spend credits. It runs the unit tests, then checks the brief's acceptance list against the real sandbox: the documented from-scratch start (`tasks.ps1 down` then `up`), both user journeys, a baseline, all eight fault types (each must be measured, rolled back and leave the sandbox healthy), the kill switch aborting a running experiment, two experiments refusing to overlap, an automatic abort on a threshold breach, refusing to inject into an unhealthy sandbox, the injecting agent, the report (every number must match a stored result), all three agents end to end, and the dashboard (its panels, downloads, security checks and emergency stop). It then verifies the sandbox is back to a clean, healthy state. `--offline-only` skips everything that needs Docker. Results: `acceptance.md` and `acceptance.json`; the exit code is 0 only if every check passed. The run injects real faults into the sandbox containers and rebuilds the sandbox from scratch (removing its demo-vote volume), so run it on a machine where that is fine; `--keep-app` skips the rebuild.
+
 ## Commands
 
 | Command | What it does |
 |---|---|
 | `chaos dashboard [--port N] [--rate R] [--open]` | **Live web page** at http://127.0.0.1:8765: charts for both user journeys, the redis queue and Postgres vote count, container table with restarts, event log, and buttons that inject real faults (plus KILL SWITCH / Reset) |
 | `chaos analyze [--offline] [--id ID] [--last N] [--dry-run]` | **Analyzer**: explains the stored experiments (root cause, blast radius, ranked weaknesses, concrete fixes). Every claim cites numbers that the data tools returned. Uses the Claude agent when a key is set, otherwise the deterministic rule-based analyzer |
-| `chaos llm-check` | Checks the Anthropic key with one tiny request (prints the key masked) |
+| `chaos llm-check [--provider anthropic\|gemini\|mistral\|openrouter\|pool] [--models] [--model M] [--match TEXT] [--no-send]` | Checks an LLM provider: is a key configured, which models can it use, does one tiny request work (a key is only ever printed masked); `--provider pool` shows every pool member and its cooldown |
 | `chaos config` | Prints the effective parameters (`config.yaml` merged over the defaults) |
 | `chaos plan [--top N] [--offline] [--dry-run]` | Ranks which experiments to run first (heuristic risk score, re-ranked by Claude when `ANTHROPIC_API_KEY` is set) |
 | `chaos agent [--top N] [--max N] [--offline] [--dry-run] [-y]` | **The injector agent**: plans, then introduces the faults one at a time through the safety guard |

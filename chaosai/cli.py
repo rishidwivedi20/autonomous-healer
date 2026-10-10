@@ -791,22 +791,23 @@ def pipeline(top: int = typer.Option(None, "--top", "-n", help="experiments to p
                 note = "  (found in the stored history: this run's experiments did not exercise it)"
             except FindingError:
                 picks = []
-        if not picks:
-            typer.echo("no vetted fix matches the findings, so nothing is changed")
-        else:
-            recipe, weakness = picks[0]
-            typer.echo(f"fixing: {recipe.title}   (addresses: {weakness.title}){note}")
-            live = start_live(c, kill_switch())
-            try:
-                fix_run = build_fixing_agent(c, live, graph, compose).run(recipe.id, weakness.title, keep=True if keep_fix else None)
-            except (fixer_mod.FixError, SafetyViolation) as e:
-                typer.secho(f"the fixing agent could not run: {e}", fg=typer.colors.RED)
-            finally:
-                live.stop()
-            if fix_run:
-                print_fix(fix_run)
-                typer.echo("\nupdating the report with the validated fix ...")
-                make_report(c, done, offline, compose, analysis=found.analysis)
+        if not picks:                                           # no finding and nothing in the history names a fixable weakness: measure, do not guess
+            picks = [(r, None) for r in fixer_mod.CATALOG.values()]
+            note = "  (no finding names it, so the agent measures whether the problem exists; it changes nothing unless it does)"
+        recipe, weakness = picks[0]
+        title = weakness.title if weakness else ""
+        typer.echo(f"fixing: {recipe.title}" + (f"   (addresses: {title})" if title else "") + note)
+        live = start_live(c, kill_switch())
+        try:
+            fix_run = build_fixing_agent(c, live, graph, compose).run(recipe.id, title, keep=True if keep_fix else None)
+        except (fixer_mod.FixError, SafetyViolation) as e:
+            typer.secho(f"the fixing agent could not run: {e}", fg=typer.colors.RED)
+        finally:
+            live.stop()
+        if fix_run:
+            print_fix(fix_run)
+            typer.echo("\nupdating the report with the validated fix ...")
+            make_report(c, done, offline, compose, analysis=found.analysis)
 
     typer.secho("\n== SUMMARY ==", bold=True)
     done_entries = [e for e in run.entries if e.status == "done"]

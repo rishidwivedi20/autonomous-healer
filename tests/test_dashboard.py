@@ -334,3 +334,20 @@ def test_graph_script_and_page_are_served_and_the_page_wires_them_together(web):
 def test_graph_routes_enforce_the_same_host_check(web):
     assert call(web.port, "GET", "/api/graph", host="evil.example")[0] == 403
     assert call(web.port, "GET", "/graph.js", host="evil.example")[0] == 403
+
+
+# ---- a target outside the allowlist is rejected at the API, not accepted and refused later in the background
+def test_inject_rejects_a_target_outside_the_allowlist_with_400_and_starts_nothing(tmp_path):
+    app, orch, kill = make_app(tmp_path)
+    orch.guard = SimpleNamespace(managed_targets={"redis", "db"})
+    code, body = app.inject({"target": "nginx", "fault": "kill"})
+    assert code == 400 and "not a managed service" in body["error"] and "db, redis" in body["error"]
+    assert not app.runner.snapshot()["running"] and orch.exps == []
+
+
+def test_inject_still_accepts_an_allowlisted_target_when_a_guard_is_present(tmp_path):
+    app, orch, kill = make_app(tmp_path)
+    orch.guard = SimpleNamespace(managed_targets={"redis", "db"})
+    code, body = app.inject({"target": "redis", "fault": "kill"})
+    assert code == 202 and wait_for(lambda: orch.entered.is_set())
+    orch.release.set()

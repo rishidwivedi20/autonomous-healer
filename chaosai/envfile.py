@@ -16,7 +16,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def load_env(path: Path | str | None = None) -> list[str]:
-    """Load KEY=VALUE lines into os.environ. Returns the names that were set (never the values)."""
+    """Load KEY=VALUE lines into os.environ. Returns the names that were set (never the values).
+    CHAOSAI_NO_DOTENV=1 skips the file entirely, so a run can be proven to use no API key even on a machine that has a .env."""
+    if os.environ.get("CHAOSAI_NO_DOTENV") == "1":
+        return []
     p = Path(path) if path else ROOT / ".env"
     try:
         text = p.read_text(encoding="utf-8-sig")

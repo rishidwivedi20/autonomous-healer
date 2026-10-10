@@ -233,16 +233,29 @@ class DockerInjector:
     def _ensure_running(c) -> None:
         c.reload()
         status = c.attrs.get("State", {}).get("Status")
-        if status == "paused":
-            c.unpause()
-        elif status != "running":
-            c.start()
+        try:
+            if status == "paused":
+                c.unpause()
+            elif status != "running":
+                c.start()
+        except Exception:
+            # The state can change between the reload and the action: the running experiment's own rollback and a concurrent
+            # `chaos abort` both unpause the same container, and the second gets Docker's "is not paused". If the container
+            # is now where we wanted it, that is success, not an error.
+            c.reload()
+            if c.attrs.get("State", {}).get("Status") != "running":
+                raise
 
     @staticmethod
     def _unpause(c) -> None:
         c.reload()
         if c.attrs.get("State", {}).get("Status") == "paused":
-            c.unpause()
+            try:
+                c.unpause()
+            except Exception:                                 # someone else (a concurrent abort) unpaused it first
+                c.reload()
+                if c.attrs.get("State", {}).get("Status") == "paused":
+                    raise
 
     @staticmethod
     def _restore_cpu(c, orig: dict) -> None:

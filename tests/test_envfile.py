@@ -51,3 +51,21 @@ def test_mask_never_reveals_the_middle_of_a_key():
     m = mask("sk-ant-api03-SECRETSECRETSECRET-wxyz")
     assert m == "sk-ant-...wxyz" and "SECRET" not in m
     assert mask("") == "(empty)" and mask("short") == "***"
+
+
+def test_chaosai_no_dotenv_skips_the_file_entirely(tmp_path, monkeypatch):
+    p = write(tmp_path, "ANTHROPIC_API_KEY=sk-ant-x1\nGEMINI_API_KEY=g1\n")
+    monkeypatch.setenv("CHAOSAI_NO_DOTENV", "1")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    assert load_env(p) == [] and "ANTHROPIC_API_KEY" not in os.environ and "GEMINI_API_KEY" not in os.environ
+
+
+def test_any_other_value_of_chaosai_no_dotenv_still_loads_the_file(tmp_path, monkeypatch):
+    p = write(tmp_path, "ANTHROPIC_API_KEY=sk-ant-x1\n")
+    monkeypatch.setenv("CHAOSAI_NO_DOTENV", "0")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    try:
+        assert load_env(p) == ["ANTHROPIC_API_KEY"]
+    finally:
+        os.environ.pop("ANTHROPIC_API_KEY", None)
