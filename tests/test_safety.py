@@ -161,3 +161,9 @@ def test_preflight_rejects_unhealthy_baseline(guard):
 def test_preflight_rejects_unhealthy_containers(guard):
     with pytest.raises(SafetyViolation, match="not healthy"):
         guard.preflight(good(), ["db"])
+
+
+def test_preflight_refusal_can_carry_a_hint_about_what_the_probe_saw(guard):
+    bad = Stats(n=50, error_rate=1.0, p50_ms=None, p95_ms=None)
+    with pytest.raises(SafetyViolation, match=r"steady state \(error rate 100%\); probe errors: 9x PoolTimeout"):
+        guard.preflight(bad, [], hint="; probe errors: 9x PoolTimeout")

@@ -89,7 +89,7 @@ def cfg_env(tmp_path, monkeypatch):
 def test_config_command_prints_effective_values(cfg_env):
     cfg_env("probe: {timeout_s: 2.5}")
     r = runner.invoke(cli.app, ["config"])
-    assert r.exit_code == 0 and "timeout_s: 2.5" in r.output and "vote_url: http://localhost:8080/" in r.output
+    assert r.exit_code == 0 and "timeout_s: 2.5" in r.output and "vote_url: http://127.0.0.1:8080/" in r.output
 
 
 def test_invalid_config_is_a_clean_error(cfg_env):

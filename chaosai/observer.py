@@ -209,11 +209,15 @@ def missing_signals(store: Store, start: float, end: float, expected_gauges: tup
 # ---------------------------------------------------------------- load probe
 @dataclass
 class ProbeConfig:
-    vote_url: str = "http://localhost:8080/"
-    result_url: str = "http://localhost:8081/"
+    vote_url: str = "http://127.0.0.1:8080/"
+    result_url: str = "http://127.0.0.1:8081/"
     interval_s: float = 1.0
     timeout_s: float = 3.0
     choices: tuple[str, str] = ("a", "b")
+    max_connections: int = 200
+
+
+POOL_RESET_AFTER = 20      # consecutive PoolTimeouts (the probe could not even send) before it builds a fresh client
 
 
 class LoadProbe:
@@ -227,6 +231,8 @@ class LoadProbe:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._n = 0
+        self._pool_stalls = 0       # consecutive PoolTimeouts
+        self.client_resets = 0
 
     def start(self) -> "LoadProbe":
         self._thread = threading.Thread(target=lambda: asyncio.run(self._run()), daemon=True, name="probe")
@@ -252,15 +258,25 @@ class LoadProbe:
                 error = f"HTTP {status}"
         except httpx.HTTPError as e:
             ok, error = False, type(e).__name__
+        self._pool_stalls = self._pool_stalls + 1 if error == "PoolTimeout" else 0
         latency = (time.perf_counter() - start) * 1000
         self.store.execute("INSERT INTO probes VALUES (?,?,?,?,?,?)", (t0, kind, int(ok), status, latency, error))
 
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
         pending: set[asyncio.Task] = set()
-        async with httpx.AsyncClient(timeout=self.cfg.timeout_s, limits=httpx.Limits(max_connections=200)) as http:
+        http = self._client()
+        try:
             next_tick = loop.time()
             while not self._stop.is_set():
+                if self._pool_stalls >= POOL_RESET_AFTER:
+                    # every connection in the pool is stuck, so nothing can be sent any more (seen after a machine stall):
+                    # start a fresh client and close the old one once its in-flight requests have timed out
+                    old, http = http, self._client()
+                    self._pool_stalls, self.client_resets = 0, self.client_resets + 1
+                    retire = asyncio.create_task(self._retire(old))
+                    pending.add(retire)
+                    retire.add_done_callback(pending.discard)
                 for _ in range(max(1, round(self.multiplier))):
                     choice = self.cfg.choices[self._n % 2]
                     self._n += 1
@@ -275,6 +291,21 @@ class LoadProbe:
                 await asyncio.sleep(max(0.0, next_tick - loop.time()))
             if pending:
                 await asyncio.wait(pending, timeout=self.cfg.timeout_s + 1)
+        finally:
+            try:
+                await http.aclose()
+            except Exception:
+                pass
+
+    def _client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(timeout=self.cfg.timeout_s, limits=httpx.Limits(max_connections=self.cfg.max_connections))
+
+    async def _retire(self, client: httpx.AsyncClient) -> None:
+        await asyncio.sleep(self.cfg.timeout_s + 0.5)
+        try:
+            await client.aclose()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------- docker watcher

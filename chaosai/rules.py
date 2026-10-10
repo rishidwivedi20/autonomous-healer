@@ -10,6 +10,9 @@ from __future__ import annotations
 
 from .analysis import Analysis, Evid, ExpAnalysis, Fix, SEVERITIES, Weakness, Recorder
 
+LATENCY_SLACK_MS = 50.0     # same slack the score uses, so tiny baselines do not look like huge ratios
+SLOW_RATIO = 5.0            # median p95 during the fault at least this many times the baseline p95
+
 
 def g(x) -> str:
     return "n/a" if x is None else f"{x:g}"
@@ -212,6 +215,45 @@ def analyse(rec: Recorder, ids: list[str]) -> Analysis:
                     change=f"{f.target}:\n  deploy:\n    replicas: 2\n# put a reverse proxy (nginx/traefik) in front and drop the fixed host port on the replicas",
                     addresses=[], evidence=[]))
             break
+
+    # ---- W8: network trouble on a dependency makes users wait seconds instead of failing fast
+    slow = []
+    for f in facts:
+        if f.fault not in ("network-delay", "network-loss"):
+            continue
+        for j in ("vote", "result"):
+            s = (f.ms or {}).get(j) or {}
+            base, med = _first(f.e, "baseline_by_journey", j, "p95_ms"), s.get("median_p95_ms")
+            if base is None or med is None or (f.max_err(j) or 0) >= 50:
+                continue                                  # a journey that went fully down is W7's finding
+            ratio = (med + LATENCY_SLACK_MS) / (base + LATENCY_SLACK_MS)
+            if ratio >= SLOW_RATIO:
+                slow.append((ratio, f, j, s, base))
+    if slow:
+        pool = [x for x in slow if not x[1].e.get("rollback_errors")] or slow
+        best: dict[str, tuple] = {}
+        for x in sorted(pool, key=lambda x: -x[0]):       # worst journey per experiment, worst experiments first
+            best.setdefault(x[1].id, x)
+        shown = list(best.values())[:3]
+        evid = [f.ev(f"{f.fault} on {f.target}: {j} journey p95 had a median of {g(s['median_p95_ms'])} ms and reached "
+                     f"{g(s['max_p95_ms'])} ms, against a baseline p95 of {g(base)} ms (no errors, just waiting)")
+                for _, f, j, s, base in shown]
+        top = shown[0]
+        targets = sorted({x[1].target for x in shown})
+        add(Weakness(title="Network trouble on a dependency makes users wait seconds instead of failing fast",
+                     severity="high" if top[0] >= 20 else "medium",
+                     services=sorted(set(targets) | {x[2] for x in shown}),
+                     description="With the network to a dependency delayed or lossy, requests did not fail: they waited, so user latency rose "
+                                 "many times over while the error rate stayed low. A health check that only looks at errors misses this, "
+                                 "and callers hold their connections the whole time.",
+                     evidence=evid),
+            Fix(title="Set short timeouts and fail fast on dependency calls",
+                rationale="A bounded timeout (with at most one retry) turns an unbounded wait into a quick, explicit failure or fallback, "
+                          "so a slow dependency cannot stall every user request.",
+                change="# in the caller (e.g. the vote service's redis client):\n"
+                       "redis = Redis(host=\"redis\", socket_connect_timeout=0.5, socket_timeout=0.5)\n"
+                       "# on timeout: return a quick 503 / 'try again' instead of holding the request open",
+                addresses=[], evidence=[]))
 
     if not weaknesses and facts:
         f = facts[0]

@@ -4,8 +4,8 @@
 # 3000 ms, 3 s); anything looser is rejected at load time.
 
 app:
-  vote_url: http://localhost:8080/
-  result_url: http://localhost:8081/
+  vote_url: http://127.0.0.1:8080/
+  result_url: http://127.0.0.1:8081/
   compose_file: deploy/docker-compose.yml
 
 probe:                       # the synthetic user: one vote POST + one result GET per interval

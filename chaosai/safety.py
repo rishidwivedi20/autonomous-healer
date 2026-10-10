@@ -146,13 +146,13 @@ class Guard:
             "thresholds": clamped,
         })
 
-    def preflight(self, baseline: Stats, unhealthy: list[str], max_error_rate: float = 0.05) -> None:
+    def preflight(self, baseline: Stats, unhealthy: list[str], max_error_rate: float = 0.05, hint: str = "") -> None:
         if self.kill.engaged:
             raise SafetyViolation("kill switch engaged (run `chaos reset` to clear)")
         if baseline.n == 0 or baseline.error_rate is None:
             raise SafetyViolation("no baseline traffic; is the app reachable?")
         if baseline.error_rate > max_error_rate:
-            raise SafetyViolation(f"not in steady state (error rate {baseline.error_rate:.0%})")
+            raise SafetyViolation(f"not in steady state (error rate {baseline.error_rate:.0%}){hint}")
         if unhealthy:
             raise SafetyViolation(f"containers not healthy: {', '.join(unhealthy)}")
 

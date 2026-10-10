@@ -131,6 +131,17 @@ class Orchestrator:
             self.sleep(min(0.25, max(0.0, t - self.clock())))
         return self.guard.kill.engaged
 
+    def _error_hint(self, t0: float, t1: float) -> str:
+        """What the probe actually saw while the baseline was being taken, so a refusal says what to look at."""
+        rows = self.store.query(
+            "SELECT COALESCE(error, 'HTTP ' || status), count(*) FROM probes WHERE ok = 0 AND t >= ? AND t <= ? "
+            "GROUP BY 1 ORDER BY 2 DESC LIMIT 3", (t0, t1))
+        if not rows:
+            return ""
+        seen = ", ".join(f"{n}x {e}" for e, n in rows)
+        return (f"; probe errors: {seen}. Check that the app answers on the probe URLs and that no other chaosai process "
+                f"(e.g. a stale `chaos dashboard`) is still writing to the same results database")
+
     # ------------------------------------------------------------ the lifecycle
     def run(self, exp: Experiment, baseline_s: float = 15, recovery_timeout_s: float = 120,
             dry_run: bool = False) -> ExperimentResult:
@@ -151,7 +162,10 @@ class Orchestrator:
         # steady state and recovery are judged on the worst journey; reported baseline stays overall
         baseline_worst = worst_window(self.store, t_start, t_base_end)
         pipe_base = pipeline_baseline(self.store, t_start, t_base_end)
-        self.guard.preflight(baseline_worst, self.health_fn(), self.preflight_max_error_rate)
+        hint = ""
+        if baseline_worst.error_rate is not None and baseline_worst.error_rate > self.preflight_max_error_rate:
+            hint = self._error_hint(t_start, t_base_end)
+        self.guard.preflight(baseline_worst, self.health_fn(), self.preflight_max_error_rate, hint)
 
         # ---- inject + monitor; rollback in finally, whatever happens
         self.guard.begin()

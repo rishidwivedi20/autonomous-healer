@@ -115,6 +115,8 @@ class Handler(BaseHTTPRequestHandler):
         self._reply()
 
     def _reply(self):
+        if Handler.mode == "hang":
+            time.sleep(1.5)                       # a server that holds every connection open
         if Handler.mode == "500":
             self.send_response(500)
         else:
@@ -285,3 +287,26 @@ def test_increases_before_and_after_a_reset_are_summed(store):
     for t, v in [(1, "5"), (20, "7"), (30, "0"), (35, "3")]:
         store.execute("INSERT INTO events VALUES (?,?,?,?)", (t, "db", "restart_count", v))
     assert restart_counts(store, 10, 60) == {"db": 2 + 3}
+
+
+def test_probe_builds_a_fresh_client_when_its_pool_is_stuck_and_recovers(store, server, monkeypatch):
+    """Connections that never come back leave every request failing with PoolTimeout; the probe must not stay dead."""
+    monkeypatch.setattr("chaosai.observer.POOL_RESET_AFTER", 3)
+    Handler.mode = "hang"
+    cfg = ProbeConfig(vote_url=server, result_url=server, interval_s=0.05, timeout_s=0.4, max_connections=1)
+    p = LoadProbe(store, cfg).start()
+    time.sleep(2.0)
+    errors = {e for (e,) in store.query("SELECT DISTINCT error FROM probes WHERE ok = 0")}
+    assert "PoolTimeout" in errors and p.client_resets >= 1
+    Handler.mode = "ok"
+    n_before = store.query("SELECT count(*) FROM probes WHERE ok = 1")[0][0]
+    time.sleep(2.5)
+    p.stop()
+    assert store.query("SELECT count(*) FROM probes WHERE ok = 1")[0][0] > n_before     # sending again after the hang ended
+
+
+def test_a_healthy_probe_never_resets_its_client(store, server):
+    p = LoadProbe(store, ProbeConfig(vote_url=server, result_url=server, interval_s=0.1, timeout_s=1.0)).start()
+    time.sleep(1.0)
+    p.stop()
+    assert p.client_resets == 0

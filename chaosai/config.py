@@ -25,8 +25,8 @@ class _Base(BaseModel):
 
 
 class AppCfg(_Base):
-    vote_url: str = "http://localhost:8080/"
-    result_url: str = "http://localhost:8081/"
+    vote_url: str = "http://127.0.0.1:8080/"
+    result_url: str = "http://127.0.0.1:8081/"
     compose_file: str = "deploy/docker-compose.yml"
 
 

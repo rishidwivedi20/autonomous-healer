@@ -3,7 +3,7 @@ param([Parameter(Mandatory)][ValidateSet("up", "down", "status")][string]$Task)
 Push-Location $PSScriptRoot          # return to the caller's folder afterwards, so `.\chaos.cmd` still works
 try {
     switch ($Task) {
-        "up"     { docker compose up -d --wait; Write-Host "vote: http://localhost:8080  result: http://localhost:8081" }
+        "up"     { docker compose up -d --wait; Write-Host "vote: http://127.0.0.1:8080  result: http://localhost:8081" }
         "down"   { docker compose down -v }
         "status" { docker compose ps }
     }

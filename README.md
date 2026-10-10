@@ -33,6 +33,8 @@ python -m venv .venv; .\.venv\Scripts\pip install -r requirements.txt
 | `chaos config` | Prints the effective parameters (`config.yaml` merged over the defaults) |
 | `chaos plan [--top N] [--offline] [--dry-run]` | Ranks which experiments to run first (heuristic risk score, re-ranked by Claude when `ANTHROPIC_API_KEY` is set) |
 | `chaos agent [--top N] [--max N] [--offline] [--dry-run] [-y]` | **The injector agent**: plans, then introduces the faults one at a time through the safety guard |
+| `chaos autopilot [--top N] [--max N] [--offline] [--dry-run] [-y]` | **Hands-off end to end**: plan, inject with the agent, analyze, score, and write the findings report |
+| `chaos report [--last N] [--offline]` | Write `results/findings.{md,html,json}` (resilience score, ranked weaknesses, cited fixes with verification re-runs) from the stored experiments |
 | `chaos discover [--live]` | Builds the dependency map from the compose file (and running containers with `--live`) |
 | `chaos baseline --seconds N` | Observes the healthy system and saves the baseline |
 | `chaos run TARGET FAULT [options]` | One experiment: preflight, baseline window, inject, monitor each second, rollback, measure recovery, write `results/<id>.json` |
@@ -80,6 +82,10 @@ Everything tunable lives in [`config.yaml`](config.yaml) (every value shown ther
 | `agent` | max experiments, cooldown, health wait, stop-on-abort, refusal limit |
 
 ## The injector agent
+
+`chaos autopilot` chains everything with no manual step: it plans, runs the agent below, then analyzes what actually ran, computes the resilience score and writes the report. If the agent stops early it still reports the experiments that finished and exits non-zero.
+
+**Resilience score** (`chaosai/scoring.py`, deterministic, from stored measurements only): per experiment 40 availability (worst journey's error-rate increase) + 20 latency (worst journey's p95 vs baseline, 50 ms slack; full marks up to 1.5x, zero at 10x) + 25 recovery (full marks at 5 s or less, zero at 60 s; users and pipeline) + 15 blast radius (collateral restarts and degraded journeys). A part that cannot be measured is dropped and listed as missing, never guessed; a run cut short by your kill switch has no recovery score. The overall score is the criticality-weighted mean of the latest run of each distinct experiment.
 
 `chaos agent` is the single component that introduces faults autonomously. It does not choose *what* to break (the planner does) or diagnose results (the Day 2 analyzer). For each planned experiment it: waits for every container to be healthy (and refuses to inject into a sick system), runs it through the safety guard and per-second abort rules, rolls back in a `finally`, pauses for a cooldown, and moves on. It stops the whole run on: kill switch, rollback problems, a Docker/injector error, unhealthy containers, or repeated refusals. It asks for confirmation unless `-y`; `--dry-run` plans and validates everything and injects nothing. Run logs go to `results/agent-runs/`.
 

@@ -332,3 +332,12 @@ def test_measure_baseline_saves_json(tmp_path):
     assert saved["overall"]["error_rate"] == 0.0 and saved["overall"]["n"] >= 18
     assert saved["overall"]["p95_ms"] == 12.0
     assert data["by_kind"]["vote"]["n"] >= 9
+
+
+def test_a_steady_state_refusal_names_what_the_probe_saw_and_where_to_look(tmp_path):
+    orch, inj, *_ = build(tmp_path, lambda t, st: (False, 10.0))
+    with pytest.raises(SafetyViolation) as e:
+        orch.run(exp(), baseline_s=5)
+    msg = str(e.value)
+    assert "steady state (error rate 100%)" in msg and "probe errors:" in msg and "x HTTP 500" in msg
+    assert "stale `chaos dashboard`" in msg and inj.injected == 0

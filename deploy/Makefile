@@ -2,8 +2,8 @@ COMPOSE = docker compose -f docker-compose.yml
 
 up:
 	$(COMPOSE) up -d --wait
-	@echo "vote:   http://localhost:8080"
-	@echo "result: http://localhost:8081"
+	@echo "vote:   http://127.0.0.1:8080"
+	@echo "result: http://127.0.0.1:8081"
 
 down:
 	$(COMPOSE) down -v
