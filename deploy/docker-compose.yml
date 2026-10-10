@@ -1,0 +1,78 @@
+# Target app: Docker's example-voting-app (vote -> redis -> worker -> postgres -> result).
+# One replica of every service on purpose: that is the weakness chaos-ai should find.
+name: chaosai-voting
+
+x-managed: &managed
+  labels:
+    chaosai.managed: "true"
+  restart: unless-stopped
+
+services:
+  vote:
+    <<: *managed
+    image: dockersamples/examplevotingapp_vote
+    ports: ["8080:80"]
+    depends_on:
+      redis: { condition: service_healthy }
+    networks: [front, back]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:80', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  redis:
+    <<: *managed
+    image: redis:7-alpine
+    networks: [back]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  worker:
+    <<: *managed
+    image: dockersamples/examplevotingapp_worker
+    depends_on:
+      redis: { condition: service_healthy }
+      db: { condition: service_healthy }
+    networks: [back]
+    # No healthcheck: the worker image exposes no port and has no shell tooling to probe it.
+    # The agent should flag this as a finding (no health signal for the worker).
+
+  db:
+    <<: *managed
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes: ["db-data:/var/lib/postgresql/data"]
+    networks: [back]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  result:
+    <<: *managed
+    image: dockersamples/examplevotingapp_result
+    ports: ["8081:80"]
+    depends_on:
+      db: { condition: service_healthy }
+    networks: [front, back]
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:80',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+networks:
+  front:
+  back:
+
+volumes:
+  db-data:
