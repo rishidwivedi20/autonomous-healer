@@ -4,6 +4,13 @@
 The probe and watcher must already be running (the CLI starts them). Time comes from
 injected clock/sleep functions so the lifecycle is unit-testable without waiting.
 
+Abort, preflight and recovery judge the WORST user journey (vote vs result), not the average.
+
+Failures are recorded when a request COMPLETES (a timeout lands `timeout_s` after it started) but
+are stamped with its start time. Looking at "the last second" therefore never sees an ongoing
+outage. All judgements use a window lagged by `settle_s` (probe timeout + margin) so every request
+in it has finished. Cost: abort fires about settle_s + breach_seconds after the fault begins.
+
 Recovery definition: "recovered" = a hold window (5 s) in which error rate is within 10% of
 baseline and p95 is within 10% of baseline plus a 50 ms slack (a 10% band on a ~10 ms local
 latency is below measurement jitter; the slack is stated here so it is not a hidden fudge).
@@ -18,7 +25,8 @@ from pathlib import Path
 from typing import Callable
 
 from .models import Experiment, ExperimentResult, Stats
-from .observer import (Store, events, missing_signals, per_second, restart_counts, window)
+from .observer import (Store, by_journey, events, missing_signals, per_second, restart_counts, window,
+                       worst_window)
 from .safety import Guard, SafetyViolation
 
 HOLD_S = 5
@@ -42,7 +50,7 @@ def find_recovery(store: Store, start: float, now: float, baseline: Stats,
     """Earliest offset (seconds from `start`) from which `hold` consecutive seconds are within
     tolerance of baseline, or None if that has not happened yet."""
     for i in range(int(now - start) - hold + 1):
-        if is_recovered(window(store, start + i, start + i + hold), baseline, tol):
+        if is_recovered(worst_window(store, start + i, start + i + hold), baseline, tol):
             return float(i)
     return None
 
@@ -51,7 +59,8 @@ class Orchestrator:
     def __init__(self, store: Store, injector, guard: Guard, results_dir: Path | str,
                  health_fn: Callable[[], list[str]] = lambda: [],
                  clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep,
-                 tick_s: float = 1.0):
+                 tick_s: float = 1.0, settle_s: float = 0.0):
+        self.settle_s = settle_s
         self.store, self.injector, self.guard = store, injector, guard
         self.results_dir = Path(results_dir)
         self.health_fn, self.clock, self.sleep, self.tick_s = health_fn, clock, sleep, tick_s
@@ -80,8 +89,11 @@ class Orchestrator:
         t_start = self.clock()
         if self._wait_until(t_start + baseline_s):
             raise SafetyViolation("kill switch engaged during baseline")
-        baseline = window(self.store, t_start, self.clock())
-        self.guard.preflight(baseline, self.health_fn())
+        t_base_end = self.clock()
+        baseline = window(self.store, t_start, t_base_end)
+        # steady state and recovery are judged on the worst journey; reported baseline stays overall
+        baseline_worst = worst_window(self.store, t_start, t_base_end)
+        self.guard.preflight(baseline_worst, self.health_fn())
 
         # ---- inject + monitor; rollback in finally, whatever happens
         self.guard.begin()
@@ -95,8 +107,8 @@ class Orchestrator:
             next_tick = t_inject + self.tick_s
             while self.clock() < deadline:
                 self._wait_until(next_tick)
-                now = self.clock()
-                if self.guard.should_abort(window(self.store, now - 1.0, now), exp.thresholds):
+                now = self.clock() - self.settle_s          # only requests that have had time to finish
+                if self.guard.should_abort(worst_window(self.store, now - 1.0, now), exp.thresholds):
                     aborted, abort_reason = True, self.guard.abort_reason
                     break
                 next_tick += self.tick_s
@@ -111,7 +123,7 @@ class Orchestrator:
         recovery = None
         while True:
             now = self.clock()
-            recovery = find_recovery(self.store, t_fault_end, now, baseline)
+            recovery = find_recovery(self.store, t_fault_end, now - self.settle_s, baseline_worst)
             if recovery is not None or now - t_fault_end >= recovery_timeout_s or self.guard.kill.engaged:
                 break
             self.sleep(self.tick_s)
@@ -122,6 +134,8 @@ class Orchestrator:
             experiment=exp, started_at=t_inject, ended_at=now,
             baseline=baseline,
             during=window(self.store, t_inject, t_end),
+            baseline_by_journey=by_journey(self.store, t_start, t_base_end),
+            during_by_journey=by_journey(self.store, t_inject, t_end),
             per_second=per_second(self.store, t_inject, t_end),
             recovery_s=recovery, recovered=recovery is not None,
             aborted=aborted, abort_reason=abort_reason,
@@ -129,7 +143,8 @@ class Orchestrator:
             restarts=restart_counts(self.store, t_inject, now),
             rollback_errors=rollback_errors,
             missing_signals=missing_signals(self.store, t_start, now, GAUGES),
-            notes=handle.actions if handle else [],
+            notes=(handle.actions if handle else []) + (
+                ["recovery not measured: kill switch engaged"] if recovery is None and self.guard.kill.engaged else []),
         )
         self.write(result)
         return result

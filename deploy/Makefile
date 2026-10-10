@@ -9,6 +9,6 @@ down:
 	$(COMPOSE) down -v
 
 status:
-	$(COMPOSE) ps --format "table {{.Service}}\t{{.State}}\t{{.Health}}\t{{.Ports}}"
+	$(COMPOSE) ps
 
 .PHONY: up down status

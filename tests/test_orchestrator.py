@@ -13,24 +13,36 @@ T0 = 1000.0
 
 
 class Sim:
-    """Fake clock. sleep() advances time and inserts one (vote, result) probe pair per whole second,
-    with ok/latency decided by `scenario(t)`."""
+    """Fake clock. sleep() advances time in 0.25 s steps and inserts one (vote, result) probe pair per
+    whole second, with ok/latency decided by `scenario(t)` (or `scenario(t, kind)` if per_kind).
+    Failed rows become visible only `fail_lag` seconds after their start time, like real timeouts."""
 
-    def __init__(self, store, scenario):
+    def __init__(self, store, scenario, per_kind=False, fail_lag=0.0):
         self.t, self.store, self.scenario, self._next_row = T0, store, scenario, T0
+        self.per_kind, self.fail_lag, self._pending = per_kind, fail_lag, []
 
     def clock(self):
         return self.t
 
+    def _insert(self, row):
+        self.store.execute("INSERT INTO probes VALUES (?,?,?,?,?,?)", row)
+
     def sleep(self, s):
         target = self.t + s
-        while self._next_row <= target:
-            ok, lat = self.scenario(self._next_row)
-            for kind in ("vote", "result"):
-                self.store.execute("INSERT INTO probes VALUES (?,?,?,?,?,?)",
-                                   (self._next_row, kind, int(ok), 200 if ok else 500, lat, None))
-            self._next_row += 1
-        self.t = target
+        while self.t < target - 1e-9:
+            self.t = min(self.t + 0.25, target)
+            while self._next_row <= self.t + 1e-9:
+                for kind in ("vote", "result"):
+                    ok, lat = self.scenario(self._next_row, kind) if self.per_kind else self.scenario(self._next_row)
+                    row = (self._next_row, kind, int(ok), 200 if ok else 500, lat, None)
+                    if ok or not self.fail_lag:
+                        self._insert(row)
+                    else:
+                        self._pending.append((self._next_row + self.fail_lag, row))
+                self._next_row += 1
+            for item in [p for p in self._pending if p[0] <= self.t + 1e-9]:
+                self._pending.remove(item)
+                self._insert(item[1])
 
 
 class FakeInjector:
@@ -51,20 +63,24 @@ class FakeInjector:
 
     def rollback(self, h):
         self.rolled_back += 1
+        self.state["t_rollback"] = self.state["clock"]()
         self.state["fault"] = False
         self.state["recover_until"] = self.state["clock"]() + self.state.get("recovery_lag", 0)
         return []
 
 
-def build(tmp_path, scenario_fn, managed=("redis",), health=lambda: [], injector_kw=None):
+def build(tmp_path, scenario_fn, managed=("redis",), health=lambda: [], injector_kw=None, per_kind=False,
+          fail_lag=0.0, settle_s=0.0):
     store = Store(tmp_path / "t.db")
     state = {}
-    sim = Sim(store, lambda t: scenario_fn(t, state))
+    sim = Sim(store, (lambda t, k: scenario_fn(t, state, k)) if per_kind else (lambda t: scenario_fn(t, state)),
+              per_kind=per_kind, fail_lag=fail_lag)
     state["clock"] = sim.clock
     kill = KillSwitch(tmp_path / "KILL")
     guard = Guard(set(managed), kill)
     inj = FakeInjector(state, **(injector_kw or {}))
-    orch = Orchestrator(store, inj, guard, tmp_path / "res", health_fn=health, clock=sim.clock, sleep=sim.sleep)
+    orch = Orchestrator(store, inj, guard, tmp_path / "res", health_fn=health, clock=sim.clock, sleep=sim.sleep,
+                        settle_s=settle_s)
     return orch, inj, guard, kill, state, sim, store
 
 
@@ -105,6 +121,60 @@ def test_auto_abort_after_three_bad_seconds_then_rollback(tmp_path):
     assert r.ended_at - r.started_at < 60                     # did not wait out the full duration
     assert state["clock"]() - state["t_inject"] < 40
     assert not guard._running
+
+
+# ---- worst journey, not the average
+def test_one_journey_fully_down_trips_abort_even_though_combined_error_rate_is_only_50pct(tmp_path):
+    """Real run: a 4 s delay on `vote` failed every vote but no result-page load -> combined 46-50%,
+    below the 50% threshold, so nothing aborted. Judging the worst journey fixes that."""
+    def scenario(t, st, kind):
+        return (False, 10.0) if st.get("fault") and kind == "vote" else healthy(t, st)
+    orch, inj, *_ = build(tmp_path, scenario, per_kind=True)
+    r = orch.run(exp(duration=60), baseline_s=5)
+    assert r.aborted and "error rate 100%" in r.abort_reason
+    assert r.during.error_rate <= 0.5                          # the average really was diluted
+    assert r.during_by_journey["vote"].error_rate >= 0.7       # (the row stamped at the injection instant predates the fault)
+    assert r.during_by_journey["result"].error_rate == 0.0
+    assert r.baseline_by_journey["vote"].error_rate == 0.0
+
+
+def test_preflight_rejects_a_broken_journey_hidden_by_the_average(tmp_path):
+    orch, inj, *_ = build(tmp_path, lambda t, st, kind: (kind != "vote", 10.0), per_kind=True)
+    with pytest.raises(SafetyViolation, match="steady state"):
+        orch.run(exp(), baseline_s=5)
+    assert inj.injected == 0
+
+
+# ---- late-recorded failures (real timeouts land timeout_s after the request started)
+def _vote_down(t, st, kind):
+    return (False, 10.0) if st.get("fault") and kind == "vote" else healthy(t, st)
+
+
+def test_timeouts_recorded_late_are_invisible_without_settling(tmp_path):
+    """Documents the real-run failure: failed votes appear 3 s late, so a 'last second' window never
+    contains them and the guard never fires."""
+    orch, *_ = build(tmp_path, _vote_down, per_kind=True, fail_lag=3.0, settle_s=0.0)
+    r = orch.run(exp(duration=30), baseline_s=5)
+    assert not r.aborted
+
+
+def test_settle_lag_catches_late_recorded_timeouts(tmp_path):
+    orch, inj, _, _, state, *_ = build(tmp_path, _vote_down, per_kind=True, fail_lag=3.0, settle_s=3.5)
+    r = orch.run(exp(duration=30), baseline_s=5)
+    assert r.aborted and "error rate 100%" in r.abort_reason and inj.rolled_back == 1
+    waited = state["t_rollback"] - state["t_inject"]
+    assert 6 <= waited <= 14        # ~settle (3.5) + 3 consecutive seconds, well under the 30 s duration
+
+
+def test_recovery_is_not_declared_early_while_timeouts_are_still_in_flight(tmp_path):
+    def scenario(t, st, kind):
+        if st.get("fault") or t < st.get("recover_until", 0):
+            return (False, 10.0) if kind == "vote" else (True, 10.0)
+        return True, 10.0
+    orch, inj, _, _, state, *_ = build(tmp_path, scenario, per_kind=True, fail_lag=3.0, settle_s=3.5)
+    state["recovery_lag"] = 4
+    r = orch.run(exp(duration=30), baseline_s=5)
+    assert r.recovered and r.recovery_s >= 3          # not 0: the in-flight failures were counted
 
 
 # ---- kill switch mid-experiment

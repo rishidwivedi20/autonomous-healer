@@ -1,4 +1,5 @@
 import json
+import re
 
 import pytest
 
@@ -8,6 +9,7 @@ from chaosai.injector import DockerInjector, InjectionError, netem_script
 class FakeContainer:
     def __init__(self, svc, managed=True, status="running", exec_ok=True, host=None):
         self.name = self.id = svc
+        self.pid = 4000 + sum(map(ord, svc))
         self.labels = {"com.docker.compose.service": svc}
         if managed:
             self.labels["chaosai.managed"] = "true"
@@ -20,7 +22,7 @@ class FakeContainer:
         self.reload()
 
     def reload(self):
-        self.attrs = {"State": {"Status": self.status}, "HostConfig": dict(self.host)}
+        self.attrs = {"State": {"Status": self.status, "Pid": self.pid}, "HostConfig": dict(self.host)}
 
     def kill(self): self.calls.append("kill"); self.status = "exited"
     def stop(self, timeout=10): self.calls.append("stop"); self.status = "exited"
@@ -56,8 +58,17 @@ class FakeClient:
     def list(self, all=False, filters=None):
         return [c for c in self.cs if c.labels.get("chaosai.managed") == "true"]
 
+    run_error = None
+
     def run(self, image, cmd, **kw):
         self.ran.append((image, cmd, kw))
+        if self.run_error:
+            raise RuntimeError(self.run_error)
+        m = re.search(r"kill -9 (\d+)", cmd[-1])
+        if m and kw.get("pid_mode") == "host":          # a real crash: process dies, container exits
+            for c in self.cs:
+                if c.pid == int(m.group(1)):
+                    c.status = "exited"
         return b""
 
 
@@ -88,6 +99,25 @@ def test_unknown_fault_rejected(world):
 
 
 # ---- kill / stop / pause + rollback
+def test_kill_is_a_real_crash_from_the_host_pid_namespace(world):
+    inj, client, redis, *_, state = world
+    h = inj.inject("redis", "kill")
+    image, cmd, kw = client.ran[0]
+    assert cmd == [f"kill -9 {redis.pid}"] and kw["pid_mode"] == "host" and kw["entrypoint"] == ["sh", "-c"]
+    assert "chaosai.managed" not in kw["labels"] and "kill" not in redis.calls    # not `docker kill`
+    assert "restart policy applies" in h.actions[0]
+    assert redis.status == "exited" and state.exists()
+    inj.rollback(h)
+
+
+def test_kill_falls_back_to_docker_kill_and_says_so(world):
+    inj, client, redis, *_ = world
+    client.run_error = "no --pid=host here"
+    h = inj.inject("redis", "kill")
+    assert "kill" in redis.calls and "will NOT revive" in h.actions[0]
+    assert inj.rollback(h) == [] and redis.status == "running"
+
+
 def test_kill_then_rollback_restarts(world):
     inj, _, redis, *_, state = world
     h = inj.inject("redis", "kill")
@@ -163,10 +193,31 @@ def test_netem_falls_back_to_sidecar_sharing_netns(tmp_path):
     h = inj.inject("redis", "network-loss", {"loss_pct": 40})
     image, cmd, kw = client.ran[0]
     assert "loss 40.0%" in cmd[-1]
+    assert kw["entrypoint"] == ["sh", "-c"]               # the image's own ENTRYPOINT is `tail -f /dev/null`
     assert kw["network_mode"] == "container:redis" and kw["cap_add"] == ["NET_ADMIN"]
     assert "chaosai.managed" not in kw["labels"]            # sidecar must never be an injection target
     assert inj.rollback(h) == []
     assert "qdisc del" in client.ran[1][1][-1]               # removal also via sidecar
+
+
+def _run_sh(script, tc_body, tmp_path):
+    import os, shutil, subprocess
+    sh = shutil.which("sh")
+    if not sh:
+        pytest.skip("no sh available")
+    stub = tmp_path / "tc"
+    stub.write_text("#!/bin/sh\n" + tc_body + "\n")
+    stub.chmod(0o755)
+    env = {**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"]}
+    return subprocess.run([sh, "-c", script], env=env, capture_output=True).returncode
+
+
+def test_netem_apply_script_fails_when_tc_is_missing_or_netem_not_visible(tmp_path):
+    """Regression: the apply script used to exit 0 (status of the skipped `lo`) even if tc failed."""
+    script = netem_script("delay 100ms")
+    assert _run_sh(script, 'exit 127', tmp_path) != 0                    # tc unusable
+    assert _run_sh(script, 'echo "qdisc noqueue"', tmp_path) != 0         # runs, but netem not visible
+    assert _run_sh(script, 'echo "qdisc netem 8001: delay 100ms"', tmp_path) == 0
 
 
 def test_netem_script_shape():
@@ -195,12 +246,12 @@ def test_rollback_continues_past_failures_and_never_raises(world):
 
 # ---- write-ahead state file + kill-switch restore
 def test_state_written_before_fault_applied(world):
-    inj, _, redis, *_, state = world
+    inj, client, redis, *_, state = world
     seen = {}
-    orig_kill = redis.kill
-    redis.kill = lambda: (seen.update(json.loads(state.read_text())), orig_kill())
+    orig_run = client.run
+    client.run = lambda *a, **k: (seen.update(json.loads(state.read_text())), orig_run(*a, **k))[1]
     inj.inject("redis", "kill")
-    assert any(v["target"] == "redis" for v in seen.values())
+    assert any(v["target"] == "redis" for v in seen.values())      # on disk before the crash happened
 
 
 def test_restore_all_from_state_after_crash(world, tmp_path):

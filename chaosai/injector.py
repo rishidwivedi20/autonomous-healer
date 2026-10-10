@@ -62,12 +62,16 @@ class Handle:
 
 
 def netem_script(args: str | None) -> str:
-    """Shell snippet applying (args) or removing (None) netem on every non-loopback interface."""
+    """Shell snippet applying (args) or removing (None) netem on every non-loopback interface.
+
+    Apply exits non-zero if ANY interface fails or netem is not visible afterwards. (A bare
+    `for ...; do [ lo ] || tc ...; done` exits with the status of its LAST iteration, normally the
+    skipped `lo`, which masked 'tc: not found' and made the exec path report false success.)"""
     if args is None:
-        body = 'tc qdisc del dev "$i" root 2>/dev/null || true'
-    else:
-        body = f'tc qdisc replace dev "$i" root netem {args}'
-    return f'for i in $(ls /sys/class/net); do [ "$i" = lo ] || {body}; done'
+        return 'for i in $(ls /sys/class/net); do [ "$i" = lo ] || tc qdisc del dev "$i" root 2>/dev/null || true; done'
+    return ('rc=0; for i in $(ls /sys/class/net); do '
+            f'[ "$i" = lo ] || tc qdisc replace dev "$i" root netem {args} || rc=1; done; '
+            'tc qdisc show | grep -q netem || rc=1; exit $rc')
 
 
 class DockerInjector:
@@ -125,10 +129,25 @@ class DockerInjector:
     # ------------------------------------------------------------ individual faults
     # Each writes its undo to the state file first, registers an undo callable, then acts.
     def _kill(self, c, h: Handle) -> None:
+        """Crash the main process the way a real failure would, so `restart:` policies apply.
+
+        `docker kill` is treated by Docker as a manual stop and is NOT revived by
+        `restart: unless-stopped` (verified on Docker Desktop 4.94). SIGKILL sent from the VM's
+        root pid namespace (--pid=host) is a genuine crash and is revived. Fallback if that is
+        unavailable: `docker kill`, which stays down until rollback restarts it."""
         self._record(h, {"restore": "ensure_running"})
         h.undo.append(lambda: self._ensure_running(c))
-        c.kill()
-        h.actions.append(f"killed {h.target}")
+        pid = (c.attrs.get("State") or {}).get("Pid")
+        try:
+            if not pid:
+                raise RuntimeError("container has no host pid")
+            self.client.containers.run(
+                self.nettools_image, [f"kill -9 {int(pid)}"], entrypoint=["sh", "-c"], pid_mode="host",
+                remove=True, detach=False, labels={"chaosai.sidecar": "true"})
+            h.actions.append(f"crashed {h.target} (SIGKILL pid {pid}; restart policy applies)")
+        except Exception as e:
+            c.kill()
+            h.actions.append(f"killed {h.target} via docker kill ({e}); restart policy will NOT revive it")
 
     def _stop(self, c, h: Handle) -> None:
         self._record(h, {"restore": "ensure_running"})
@@ -201,8 +220,9 @@ class DockerInjector:
             except Exception:
                 pass    # no shell / no tc / no NET_ADMIN: fall through to the sidecar
         self.client.containers.run(
-            self.nettools_image, ["sh", "-c", script], network_mode=f"container:{c.id}",
-            cap_add=["NET_ADMIN"], remove=True, detach=False, labels={"chaosai.sidecar": "true"})
+            self.nettools_image, [script], entrypoint=["sh", "-c"],      # image ENTRYPOINT is `tail -f /dev/null`
+            network_mode=f"container:{c.id}", cap_add=["NET_ADMIN"], remove=True, detach=False,
+            labels={"chaosai.sidecar": "true"})
         return "sidecar"
 
     def _clear_netem(self, c, method: str) -> None:

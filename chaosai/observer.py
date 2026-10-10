@@ -99,6 +99,24 @@ def window(store: Store, start: float, end: float, kind: str | None = None) -> S
     return stats_of(store.query(sql, args))
 
 
+def by_journey(store: Store, start: float, end: float) -> dict[str, Stats]:
+    kinds = [k for (k,) in store.query("SELECT DISTINCT kind FROM probes WHERE t >= ? AND t < ? ORDER BY kind", (start, end))]
+    return {k: window(store, start, end, k) for k in kinds}
+
+
+def worst_window(store: Store, start: float, end: float) -> Stats:
+    """Stats of the WORST user journey, not the average: if every vote fails while the result page
+    is fine, the combined error rate is only 50%, but the vote journey is 100% down. Safety checks
+    (abort, preflight) and recovery use this so a total outage of one journey is never diluted."""
+    per = [s for s in by_journey(store, start, end).values() if s.n]
+    if not per:
+        return Stats()
+    p50 = [s.p50_ms for s in per if s.p50_ms is not None]
+    p95 = [s.p95_ms for s in per if s.p95_ms is not None]
+    return Stats(n=sum(s.n for s in per), error_rate=max(s.error_rate for s in per),
+                 p50_ms=max(p50) if p50 else None, p95_ms=max(p95) if p95 else None)
+
+
 def per_second(store: Store, start: float, end: float, kind: str | None = None) -> list[SecondStat]:
     """One entry per whole second from `start`; t is seconds since start. Empty seconds have n=0."""
     sql = "SELECT t, ok, latency_ms FROM probes WHERE t >= ? AND t < ?"
@@ -166,8 +184,11 @@ def missing_signals(store: Store, start: float, end: float, expected_gauges: tup
             missing.append(f"gauge {name}: no readings")
         elif all(v is None for _, v in series):
             missing.append(f"gauge {name}: every read failed")
-    if not events(store, start, end):
-        missing.append("no container events recorded (watcher not running?)")
+    # Events are stored on change only, so a quiet window has none. Gauge rows are written every
+    # couple of seconds (NULL when unreadable), so they are the watcher's heartbeat.
+    if not events(store, start, end) and not store.query(
+            "SELECT 1 FROM gauges WHERE t >= ? AND t <= ? LIMIT 1", (start, end)):
+        missing.append("watcher produced no events or gauge readings (not running?)")
     return missing
 
 
@@ -207,6 +228,8 @@ class LoadProbe:
         t0 = time.time()
         start = time.perf_counter()
         status, error = None, None
+        if kind == "vote":
+            http.cookies.clear()    # every vote is a new voter; one persistent voter_id would just update one row
         try:
             r = await http.request(method, url, data=data)
             status = r.status_code
@@ -221,7 +244,6 @@ class LoadProbe:
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
         pending: set[asyncio.Task] = set()
-        # fresh cookie jar per request would fake many voters; one client = one voter, which is fine here
         async with httpx.AsyncClient(timeout=self.cfg.timeout_s, limits=httpx.Limits(max_connections=200)) as http:
             next_tick = loop.time()
             while not self._stop.is_set():

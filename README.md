@@ -2,7 +2,7 @@
 
 Inject failures into a small microservices app (Docker's example-voting-app), observe the real impact, then (Day 2) have an AI agent diagnose what broke from stored evidence and recommend cited fixes. See [PLAN.md](PLAN.md).
 
-**Status: Day 1 code complete and unit-tested (103 tests). Not yet exercised against real Docker.**
+**Status: Day 1 complete and verified on real Docker Desktop (115 unit tests; baseline, redis crash, auto-abort and mid-run kill switch all exercised live).**
 
 ## Reproduce from scratch (Windows, PowerShell)
 
@@ -53,11 +53,14 @@ results/  graph.json  baseline.json  chaosai.db  <experiment-id>.json   (gitigno
 tests/
 ```
 
-## Known limits (reported, not hidden)
+## Known limits and findings from real runs (reported, not hidden)
 
-- The result page is static HTML (data arrives over a websocket), so a 200 from it does not prove postgres is up. Two gauges read inside the containers cover the worker/db path: `redis_queue_len` and `db_votes`. `worker` and `db` experiments show up there, not in the probe error rate.
+- **`kill` is a real crash, not `docker kill`.** Docker treats `docker kill` as a manual stop and will NOT revive the container under `restart: unless-stopped` (observed: still down after 25 s). `kill` therefore sends SIGKILL from the Docker VM's pid namespace (`--pid=host` sidecar), which the restart policy does revive. If that is unavailable it falls back to `docker kill` and says so in the result notes; use `stop` for a deliberate manual stop.
+- **Redis crash is invisible to the probe.** Redis restarts in about a second, so a 1 req/s probe sees no errors. The impact shows only in the gauges: the worker stalls for roughly 6 s (`redis_queue_len` grows while `db_votes` is flat). The result page is static HTML, so `worker`/`db` faults also show up only in `redis_queue_len` / `db_votes`.
+- **Abort, preflight and recovery judge the worst journey** (vote vs result), not the average. A total vote outage with a healthy result page averages only ~46-50% errors.
+- **Failures are recorded when a request completes**, so a timeout lands `timeout_s` after it started. All judgements use a window lagged by `timeout_s + 0.5 s`; the auto-abort therefore fires about 6-7 s after a fault begins (about 3.5 s settle + 3 s breach).
 - Latency percentiles are over successful requests only; when every request fails they are `null`, not 0.
 - Recovery = 5 consecutive seconds within 10% of baseline (error rate) and 10% + 50 ms slack (p95).
-- Untested against real Docker: cpu/memory limit removal (verified after restore, reported if it fails) and the tc sidecar image used when the target has no `tc`.
+- The tc sidecar image `ghcr.io/alexei-led/pumba-alpine-nettools` has `ENTRYPOINT tail -f /dev/null`, so commands run with `--entrypoint sh`. Netem is tried inside the target first, then in the sidecar; the apply script verifies netem is actually present.
 
 `ANTHROPIC_API_KEY` (Day 2) is read from the environment and never committed.

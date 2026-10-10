@@ -70,6 +70,8 @@ class ExperimentResult(BaseModel):
     dry_run: bool = False
     baseline: Stats
     during: Stats
+    baseline_by_journey: dict[str, Stats] = Field(default_factory=dict)   # vote / result
+    during_by_journey: dict[str, Stats] = Field(default_factory=dict)
     per_second: list[SecondStat] = Field(default_factory=list)
     recovery_s: Optional[float] = None        # None = did not recover / not measured
     recovered: bool = False

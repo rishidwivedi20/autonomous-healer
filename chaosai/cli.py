@@ -150,7 +150,8 @@ def run(target: str = typer.Argument(..., help="service name, e.g. redis"),
     kill.install_signal_handlers()
     probe.start()
     watcher.start()
-    orch = Orchestrator(store, injector, guard, RESULTS, health_fn=lambda: unhealthy(watcher.snapshot()))
+    orch = Orchestrator(store, injector, guard, RESULTS, health_fn=lambda: unhealthy(watcher.snapshot()),
+                        settle_s=probe.cfg.timeout_s + 0.5)
     try:
         result = orch.run(exp, baseline_s=baseline_s, recovery_timeout_s=recovery_timeout)
     except (SafetyViolation, InjectionError) as e:
@@ -169,7 +170,13 @@ def run(target: str = typer.Argument(..., help="service name, e.g. redis"),
     typer.echo(f"  baseline : {fmt(b)}")
     typer.echo(f"  during   : {fmt(d)}")
     typer.echo(f"  aborted  : {result.aborted}" + (f" ({result.abort_reason})" if result.aborted else ""))
-    typer.echo(f"  recovery : {'%.0fs' % result.recovery_s if result.recovered else 'NOT recovered within timeout'}")
+    if result.recovered:
+        recovery = "%.0fs" % result.recovery_s
+    elif result.abort_reason == "kill switch":
+        recovery = "not measured (kill switch engaged)"
+    else:
+        recovery = "NOT recovered within timeout"
+    typer.echo(f"  recovery : {recovery}")
     typer.echo(f"  restarts : {result.restarts or 'none observed'}")
     for m in result.missing_signals:
         typer.secho(f"  missing signal: {m}", fg=typer.colors.YELLOW)

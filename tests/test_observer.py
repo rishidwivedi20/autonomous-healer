@@ -4,7 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from chaosai.observer import (DockerWatcher, LoadProbe, ProbeConfig, Store, events, gauge_series, missing_signals,
+from chaosai.observer import (by_journey, worst_window, DockerWatcher, LoadProbe, ProbeConfig, Store, events, gauge_series, missing_signals,
                               per_second, percentile, restart_counts, stats_of, unhealthy, window)
 
 
@@ -92,7 +92,7 @@ def test_missing_signals_reports_gaps(store):
     miss = missing_signals(store, 0, 10, ("db_votes",))
     assert "no probe samples in window" in miss
     assert any("db_votes" in m for m in miss)
-    assert any("no container events" in m for m in miss)
+    assert any("watcher produced no" in m for m in miss)
     store.execute("INSERT INTO gauges VALUES (1,'db_votes',NULL)")
     assert any("every read failed" in m for m in missing_signals(store, 0, 10, ("db_votes",)))
 
@@ -101,6 +101,7 @@ def test_missing_signals_reports_gaps(store):
 class Handler(BaseHTTPRequestHandler):
     mode = "ok"
     seen: list = []
+    cookies_received: list = []
 
     def log_message(self, *a): pass
 
@@ -108,6 +109,7 @@ class Handler(BaseHTTPRequestHandler):
         self._reply()
 
     def do_POST(self):
+        Handler.cookies_received.append(self.headers.get("Cookie"))
         body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
         Handler.seen.append(body)
         self._reply()
@@ -117,13 +119,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(500)
         else:
             self.send_response(200)
+        self.send_header("Set-Cookie", "voter_id=abc123; Path=/")   # like the real vote app
         self.end_headers()
         self.wfile.write(b"x")
 
 
 @pytest.fixture
 def server():
-    Handler.mode, Handler.seen = "ok", []
+    Handler.mode, Handler.seen, Handler.cookies_received = "ok", [], []
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{srv.server_port}/"
@@ -229,3 +232,33 @@ def test_gauges_store_value_and_null_on_failure(store):
     DockerWatcher(store, client=FakeClient(redis, db)).read_gauges()
     assert gauge_series(store, "redis_queue_len", 0, time.time() + 1)[0][1] == 7.0
     assert gauge_series(store, "db_votes", 0, time.time() + 1)[0][1] is None
+
+
+def test_every_vote_is_a_new_voter(store, server):
+    """The real vote app keys rows by the voter_id cookie; reusing one would update a single row and
+    the db_votes gauge could never show progress."""
+    run_probe(store, server, 2.0)
+    assert len(Handler.cookies_received) >= 3
+    assert all(c is None for c in Handler.cookies_received)
+
+
+def test_quiet_window_with_live_watcher_is_not_reported_missing(store):
+    """Events are change-only; a healthy quiet window has none. Gauge rows prove the watcher ran."""
+    add(store, 5.0)
+    store.execute("INSERT INTO gauges VALUES (5,'redis_queue_len',0)")
+    store.execute("INSERT INTO gauges VALUES (5,'db_votes',10)")
+    assert missing_signals(store, 0, 10, ("redis_queue_len", "db_votes")) == []
+
+
+def test_worst_window_is_not_diluted_by_a_healthy_journey(store):
+    for t in (1.0, 2.0, 3.0):
+        add(store, t, ok=0, kind="vote")
+        add(store, t, ok=1, kind="result", lat=5.0)
+    assert window(store, 0, 10).error_rate == 0.5              # the average hides it
+    w = worst_window(store, 0, 10)
+    assert w.error_rate == 1.0 and w.p95_ms == 5.0 and w.n == 6
+    assert set(by_journey(store, 0, 10)) == {"vote", "result"}
+
+
+def test_worst_window_empty(store):
+    assert worst_window(store, 0, 10).n == 0
