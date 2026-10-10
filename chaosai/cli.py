@@ -84,7 +84,8 @@ def probe_config(c: config_mod.Config, vote_url=None, result_url=None) -> ProbeC
 
 def orchestrator_kwargs(c: config_mod.Config) -> dict:
     return dict(hold_s=c.experiment.recovery_hold_s, tolerance=c.experiment.recovery_tolerance,
-                slack_ms=c.experiment.recovery_latency_slack_ms,
+                slack_ms=c.experiment.recovery_latency_slack_ms, queue_slack=c.experiment.recovery_queue_slack,
+                votes_fraction=c.experiment.recovery_votes_fraction,
                 preflight_max_error_rate=c.safety.preflight_max_error_rate)
 
 
@@ -387,6 +388,10 @@ def run(target: str = typer.Argument(..., help="service name, e.g. redis"),
     typer.echo(f"  aborted  : {result.aborted}" + (f" ({result.abort_reason})" if result.aborted else ""))
     if result.recovered:
         recovery = "%.0fs" % result.recovery_s
+        if result.pipeline_assessed:
+            recovery += f" (probe {result.recovery_probe_s:.0f}s, pipeline {result.recovery_pipeline_s:.0f}s)"
+        else:
+            recovery += " (probe only: pipeline gauges unavailable)"
     elif result.abort_reason == "kill switch":
         recovery = "not measured (kill switch engaged)"
     else:

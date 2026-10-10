@@ -74,7 +74,10 @@ class ExperimentResult(BaseModel):
     baseline_by_journey: dict[str, Stats] = Field(default_factory=dict)   # vote / result
     during_by_journey: dict[str, Stats] = Field(default_factory=dict)
     per_second: list[SecondStat] = Field(default_factory=list)
-    recovery_s: Optional[float] = None        # None = did not recover / not measured
+    recovery_s: Optional[float] = None        # None = did not recover / not measured; probe AND pipeline healthy
+    recovery_probe_s: Optional[float] = None      # when the user-facing probe alone was back to baseline
+    recovery_pipeline_s: Optional[float] = None   # when redis queue + postgres vote rate alone were back to normal
+    pipeline_assessed: bool = False               # False = no usable gauge readings in the baseline window
     recovered: bool = False
     aborted: bool = False
     abort_reason: Optional[str] = None

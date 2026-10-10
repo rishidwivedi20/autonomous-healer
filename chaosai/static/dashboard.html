@@ -74,6 +74,8 @@
     <button class="crash" data-fault='{"target":"worker","fault":"kill"}'>Crash Worker</button>
     <button data-fault='{"target":"db","fault":"pause"}'>Pause DB</button>
     <button data-fault='{"target":"vote","fault":"network-delay","params":{"latency_ms":1000}}'>Delay Vote 1s</button>
+    <button data-fault='{"target":"db","fault":"memory-limit","params":{"mem":"16m"}}'>Memory cap DB 16m</button>
+    <button data-fault='{"target":"vote","fault":"traffic-spike","params":{"multiplier":5}}'>Traffic x5</button>
     <button class="kill" id="abort">KILL SWITCH</button>
     <button id="reset">Reset</button>
   </div>
@@ -223,7 +225,7 @@ function render(d) {
     const j = k => Object.entries(r[k]).map(([n, s]) => `${n}: ${s.error_rate == null ? 'n/a' : (s.error_rate * 100).toFixed(0) + '% err'}, p95 ${s.p95_ms == null ? 'n/a' : Math.round(s.p95_ms) + ' ms'}`).join(' &middot; ');
     el.innerHTML = `<div><b>${ex.fault}</b> on <b>${ex.target}</b> &mdash; ${r.aborted ? '<span style="color:var(--bad)">auto-aborted: ' + r.abort_reason + '</span>' : 'ran to completion'}</div>
       <div>baseline &nbsp;${j('baseline')}</div><div>during fault &nbsp;${j('during')}</div>
-      <div>recovery: ${r.recovered ? r.recovery_s + ' s (by probe metrics)' : 'not confirmed'} &middot; restarts: ${Object.entries(r.restarts).map(([k, n]) => k + ' x' + n).join(', ') || 'none'}</div>
+      <div>recovery: ${r.recovered ? r.recovery_s + ' s' + (r.pipeline_assessed ? ' (probe ' + r.recovery_probe_s + ' s, pipeline ' + r.recovery_pipeline_s + ' s)' : ' (probe only: pipeline gauges unavailable)') : 'not confirmed'} &middot; restarts: ${Object.entries(r.restarts).map(([k, n]) => k + ' x' + n).join(', ') || 'none'}</div>
       ${r.rollback_errors.length ? '<div style="color:var(--bad)">ROLLBACK PROBLEMS: ' + r.rollback_errors.join('; ') + '</div>' : '<div>rollback clean</div>'}
       ${r.missing_signals.length ? '<div style="color:var(--warn)">missing signals: ' + r.missing_signals.join('; ') + '</div>' : ''}`;
   }

@@ -62,6 +62,8 @@ class ExperimentCfg(_Base):
     recovery_hold_s: int = Field(5, ge=1)
     recovery_tolerance: float = Field(0.10, ge=0)
     recovery_latency_slack_ms: float = Field(50.0, ge=0)
+    recovery_queue_slack: float = Field(2.0, ge=0)          # redis queue may exceed its baseline max by this much
+    recovery_votes_fraction: float = Field(0.5, ge=0, le=1)  # postgres must ingest at least this fraction of the baseline vote rate
 
 
 class FaultCfg(_Base):

@@ -25,6 +25,8 @@ experiment:
   recovery_hold_s: 5         # "recovered" = this many consecutive seconds back near baseline
   recovery_tolerance: 0.10   # within 10% of baseline ...
   recovery_latency_slack_ms: 50    # ... plus this slack on p95 (10% of ~10 ms is below measurement jitter)
+  recovery_queue_slack: 2          # pipeline: redis queue may exceed its baseline max by this many votes
+  recovery_votes_fraction: 0.5     # pipeline: postgres must ingest at least this fraction of the baseline vote rate
 
 faults:                      # per-fault defaults; planner and `chaos run` use these
   kill:           {duration_s: 30}

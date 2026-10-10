@@ -8,9 +8,9 @@ Safety properties, all independent of the Guard in safety.py (defense in depth):
   * rollback()/restore_all() never raise: they continue past failures and return the errors.
   * A fault that fails halfway through is undone before inject() raises.
 
-Untested against real Docker as of writing (not installed on the dev machine): cpu/memory
-limit removal and the tc sidecar. Limit restores are therefore VERIFIED by re-inspecting the
-container, and any mismatch is returned as a rollback error instead of being assumed fine.
+Limit restores are VERIFIED by re-inspecting the container, and any mismatch is returned as a
+rollback error instead of being assumed fine. (That check is what caught that Docker cannot remove a
+memory limit from a running container; see _restore_memory.)
 """
 from __future__ import annotations
 
@@ -252,14 +252,28 @@ class DockerInjector:
         if (orig["cpu_quota"] or 0) <= 0 and quota > 0:
             raise RuntimeError(f"cpu limit not removed (CpuQuota={quota}); recreate the container")
 
+    def _engine_memory(self) -> int:
+        try:
+            return int(self.client.info()["MemTotal"])
+        except Exception:
+            return 1 << 36                                   # 64 GiB: larger than any laptop, still a valid limit
+
     def _restore_memory(self, c, orig: dict) -> None:
-        mem = orig["memory"] if orig["memory"] > 0 else -1
-        swap = orig["memswap"] if orig["memswap"] != 0 else -1
+        """Docker cannot REMOVE a memory limit from a running container (verified on Docker Desktop 4.94):
+        `Memory=0` in an update means "unchanged" and `-1` is rejected ("Minimum memory limit allowed is
+        6MB"). So an originally-unlimited container is restored by lifting the cap to the engine's total
+        RAM, which is unlimited in practice, and the restore verifies exactly that. (`docker compose up -d
+        --force-recreate <service>` restores the literal original config; the data volume is kept.)"""
+        if orig["memory"] > 0:                               # it had a real limit of its own: put that back exactly
+            mem, swap = orig["memory"], (orig["memswap"] if orig["memswap"] != 0 else -1)
+        else:
+            mem, swap = self._engine_memory(), -1
         c.update(mem_limit=mem, memswap_limit=swap)
         c.reload()
         now = c.attrs.get("HostConfig", {}).get("Memory") or 0
-        if orig["memory"] <= 0 and now > 0:
-            raise RuntimeError(f"memory limit not removed (Memory={now}); recreate the container")
+        if now != mem:
+            raise RuntimeError(f"memory limit not restored (wanted {mem}, container has {now}); "
+                               "recreate the container: docker compose up -d --force-recreate <service>")
 
     # ------------------------------------------------------------ rollback
     def rollback(self, handle: Handle) -> list[str]:

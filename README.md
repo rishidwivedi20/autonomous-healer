@@ -2,7 +2,7 @@
 
 Inject failures into a small microservices app (Docker's example-voting-app), observe the real impact, then (Day 2) have an AI agent diagnose what broke from stored evidence and recommend cited fixes. See [PLAN.md](PLAN.md).
 
-**Status: Day 1 complete and verified on real Docker Desktop (221 unit tests; baseline, redis crash, auto-abort, mid-run kill switch and the injector agent all exercised live).**
+**Status: Day 1 complete and verified on real Docker Desktop (241 unit tests; baseline, redis crash, auto-abort, mid-run kill switch and the injector agent all exercised live).**
 
 ## Reproduce from scratch (Windows, PowerShell)
 
@@ -88,7 +88,9 @@ tests/
 - **Abort, preflight and recovery judge the worst journey** (vote vs result), not the average. A total vote outage with a healthy result page averages only ~46-50% errors.
 - **Failures are recorded when a request completes**, so a timeout lands `timeout_s` after it started. All judgements use a window lagged by `timeout_s + 0.5 s`; the auto-abort therefore fires about 6-7 s after a fault begins (about 3.5 s settle + 3 s breach).
 - Latency percentiles are over successful requests only; when every request fails they are `null`, not 0.
-- Recovery = 5 consecutive seconds within 10% of baseline (error rate) and 10% + 50 ms slack (p95).
+- **Recovery = probe AND pipeline.** A 5-second hold window counts only if the probe is within 10% of baseline (error rate; p95 + 50 ms slack) **and** the redis queue is back within its baseline maximum (+10% + 2 votes) **and** Postgres is ingesting at >= 50% of the baseline vote rate (an unreadable gauge counts as unhealthy). The result reports each part: `recovery_probe_s`, `recovery_pipeline_s`, and `pipeline_assessed` (false = no usable gauge readings, so the probe alone decided). Measured live: a 20 s `db pause` showed probe recovery 0 s but pipeline recovery 22 s, because 99 votes had queued.
+- **Docker cannot remove a memory limit from a running container** (`Memory=0` in an update means "unchanged"; `-1` is rejected with "Minimum memory limit allowed is 6MB"). `memory-limit` therefore restores an originally-unlimited container by lifting the cap to the engine's total RAM (unlimited in practice) and verifies that; `docker compose up -d --force-recreate <service>` restores the literal original config (the data volume is kept). A cap of 16 MB crash-loops Postgres (OOM-killed repeatedly; `result` and `worker` restart once each); recovery took ~49 s because of the vote backlog.
+- **The single worker processes ~9.5 votes/s.** A x5 `traffic-spike` (25 votes/s) grew the redis queue to ~309 votes (about 30 s of lag at the peak) with no user-visible errors (vote p95 19 -> 54 ms), and the backlog took ~93 s to drain. Use `experiment.recovery_timeout_s` >= 120 for this fault.
 - The tc sidecar image `ghcr.io/alexei-led/pumba-alpine-nettools` has `ENTRYPOINT tail -f /dev/null`, so commands run with `--entrypoint sh`. Netem is tried inside the target first, then in the sidecar; the apply script verifies netem is actually present.
 
 `ANTHROPIC_API_KEY` (Day 2) is read from the environment and never committed.

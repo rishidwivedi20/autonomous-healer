@@ -40,7 +40,12 @@ class FakeContainer:
             self.host["CpuPeriod"] = kw["cpu_period"]
         if "mem_limit" in kw:
             ml = kw["mem_limit"]
-            self.host["Memory"] = 0 if ml == -1 else (33554432 if ml == "32m" else ml)
+            ml = 33554432 if ml == "32m" else (16777216 if ml == "16m" else ml)
+            # real Docker (verified live): -1 is rejected, 0 means "unchanged", values under 6 MB are rejected
+            if ml != 0 and ml < 6 * 1024 * 1024:
+                raise RuntimeError('400 Client Error: Bad Request ("Minimum memory limit allowed is 6MB")')
+            if ml != 0:
+                self.host["Memory"] = ml
 
     def exec_run(self, cmd, user=None):
         self.calls.append(("exec", cmd[-1]))
@@ -57,6 +62,9 @@ class FakeClient:
 
     def list(self, all=False, filters=None):
         return [c for c in self.cs if c.labels.get("chaosai.managed") == "true"]
+
+    def info(self):
+        return {"MemTotal": 4 * 1024 ** 3}
 
     run_error = None
 
@@ -159,12 +167,39 @@ def test_cpu_limit_restores_preexisting_limit(tmp_path):
     assert c.host["CpuQuota"] == 50000
 
 
-def test_memory_limit_applied_and_removed(world):
+def test_memory_limit_applied_and_lifted_to_engine_ram(world):
+    """Docker cannot remove a memory limit from a running container, so an originally-unlimited container
+    is restored by lifting the cap to the engine's RAM (verified live; -1 is rejected)."""
     inj, _, redis, *_ = world
     h = inj.inject("redis", "memory-limit")
     assert redis.host["Memory"] == 33554432
     assert inj.rollback(h) == []
-    assert redis.host["Memory"] == 0
+    assert redis.host["Memory"] == 4 * 1024 ** 3                    # effectively unlimited, and verified
+
+
+def test_memory_restore_puts_back_a_real_preexisting_limit_exactly(tmp_path):
+    c = FakeContainer("redis", host={"Memory": 268435456, "MemorySwap": 536870912})
+    inj = DockerInjector(FakeClient(c), state_path=tmp_path / "f.json")
+    h = inj.inject("redis", "memory-limit", {"mem": "16m"})
+    assert c.host["Memory"] == 16777216
+    assert inj.rollback(h) == []
+    assert c.host["Memory"] == 268435456
+
+
+def test_memory_restore_never_sends_minus_one_which_docker_rejects(world):
+    inj, _, redis, *_ = world
+    h = inj.inject("redis", "memory-limit")
+    inj.rollback(h)
+    sent = [kw["mem_limit"] for call in redis.calls if isinstance(call, tuple) and call[0] == "update" for kw in [call[1]] if "mem_limit" in kw]
+    assert -1 not in sent and 0 not in sent
+
+
+def test_memory_restore_failure_is_reported_with_the_recreate_hint(world):
+    inj, _, redis, *_ = world
+    h = inj.inject("redis", "memory-limit")
+    redis.update = lambda **kw: None                                  # docker silently ignores the restore
+    errors = inj.rollback(h)
+    assert errors and "not restored" in errors[0] and "force-recreate" in errors[0]
 
 
 def test_limit_not_actually_removed_is_reported_not_assumed(world):

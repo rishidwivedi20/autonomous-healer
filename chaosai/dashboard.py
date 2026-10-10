@@ -126,10 +126,11 @@ class Runner:
     def _run(self, exp: Experiment) -> None:
         result, error = None, None
         try:
-            r = self.orch.run(exp, baseline_s=self.cfg.dashboard.baseline_s, recovery_timeout_s=60)
+            r = self.orch.run(exp, baseline_s=self.cfg.dashboard.baseline_s, recovery_timeout_s=self.cfg.experiment.recovery_timeout_s)
             result = {
                 "aborted": r.aborted, "abort_reason": r.abort_reason, "recovered": r.recovered,
-                "recovery_s": r.recovery_s, "restarts": r.restarts, "rollback_errors": r.rollback_errors,
+                "recovery_s": r.recovery_s, "recovery_probe_s": r.recovery_probe_s,
+                "recovery_pipeline_s": r.recovery_pipeline_s, "pipeline_assessed": r.pipeline_assessed, "restarts": r.restarts, "rollback_errors": r.rollback_errors,
                 "notes": r.notes, "missing_signals": r.missing_signals,
                 "baseline": {j: {"n": s.n, "error_rate": s.error_rate, "p95_ms": s.p95_ms} for j, s in r.baseline_by_journey.items()},
                 "during": {j: {"n": s.n, "error_rate": s.error_rate, "p95_ms": s.p95_ms} for j, s in r.during_by_journey.items()},

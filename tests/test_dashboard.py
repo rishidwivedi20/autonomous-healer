@@ -79,6 +79,7 @@ class FakeOrch:
         self.injector.rollback(h)
         st = lambda e, p: SimpleNamespace(n=5, error_rate=e, p95_ms=p)
         return SimpleNamespace(aborted=False, abort_reason=None, recovered=True, recovery_s=2.0, restarts={"redis": 1},
+                               recovery_probe_s=1.0, recovery_pipeline_s=2.0, pipeline_assessed=True,
                                rollback_errors=[], notes=["crashed redis"], missing_signals=[],
                                baseline_by_journey={"vote": st(0.0, 12.0)}, during_by_journey={"vote": st(0.5, 300.0)})
 
@@ -121,7 +122,7 @@ def test_button_experiments_use_config_defaults(tmp_path):
     app.inject({"target": "vote", "fault": "network-delay", "params": {"latency_ms": 900}})
     orch.entered.wait(2)
     exp, baseline_s, recovery = orch.exps[0]
-    assert exp.params == {"latency_ms": 900} and exp.duration_s == 20 and baseline_s == 8 and recovery == 60
+    assert exp.params == {"latency_ms": 900} and exp.duration_s == 20 and baseline_s == 8 and recovery == 120
     assert exp.thresholds.error_rate == 0.5
     orch.release.set()
 
