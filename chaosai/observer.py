@@ -316,6 +316,29 @@ GAUGE_COMMANDS = {
 }
 
 
+WORST_STATE_FIRST = ("dead", "exited", "restarting", "removing", "paused", "created")
+
+
+def combine_state(states: list[str]) -> str:
+    """One state for a service with several replicas: 'running' only if every replica is; otherwise the worst one."""
+    for s in WORST_STATE_FIRST:
+        if s in states:
+            return s
+    others = [s for s in states if s != "running"]
+    return others[0] if others else "running"
+
+
+def combine_health(healths: list[str | None]) -> str | None:
+    """One health for a service with several replicas: None if none has a healthcheck, else unhealthy > starting > healthy."""
+    known = [h for h in healths if h]
+    if not known:
+        return None
+    for h in ("unhealthy", "starting"):
+        if h in known:
+            return h
+    return "healthy" if all(h == "healthy" for h in known) else known[0]
+
+
 class DockerWatcher:
     """Polls managed containers; stores an event only when something changes (plus a first snapshot)."""
 
@@ -330,41 +353,34 @@ class DockerWatcher:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
-    def snapshot(self) -> dict[str, tuple[str, str | None]]:
-        """service -> (state, health). health None = container has no healthcheck."""
-        snap = {}
-        for c in self.client.containers.list(all=True, filters={"label": self.label}):
-            c.reload()
-            state = c.attrs.get("State", {})
-            snap[c.labels.get("com.docker.compose.service", c.name)] = (
-                state.get("Status", "unknown"), (state.get("Health") or {}).get("Status"))
-        return snap
-
-    def table(self) -> dict[str, dict]:
-        """service -> {state, health, restarts} for the dashboard's container table."""
-        out = {}
+    def _services(self) -> dict[str, dict]:
+        """service -> {state, health, restarts}, combined over ALL replicas of that service. Keying by service alone would let replicas
+        overwrite each other, and replicas with different restart counts would look like a restart on every poll."""
+        agg: dict[str, dict] = {}
         for c in self.client.containers.list(all=True, filters={"label": self.label}):
             c.reload()
             st = c.attrs.get("State", {})
-            out[c.labels.get("com.docker.compose.service", c.name)] = {
-                "state": st.get("Status", "unknown"),
-                "health": (st.get("Health") or {}).get("Status"),
-                "restarts": int(c.attrs.get("RestartCount", 0)),
-            }
-        return out
+            e = agg.setdefault(c.labels.get("com.docker.compose.service", c.name), {"states": [], "healths": [], "restarts": 0})
+            e["states"].append(st.get("Status", "unknown"))
+            e["healths"].append((st.get("Health") or {}).get("Status"))
+            e["restarts"] += int(c.attrs.get("RestartCount", 0))
+        return {svc: {"state": combine_state(e["states"]), "health": combine_health(e["healths"]), "restarts": e["restarts"]}
+                for svc, e in agg.items()}
+
+    def snapshot(self) -> dict[str, tuple[str, str | None]]:
+        """service -> (state, health). health None = no replica has a healthcheck. With several replicas the worst one decides."""
+        return {svc: (v["state"], v["health"]) for svc, v in self._services().items()}
+
+    def table(self) -> dict[str, dict]:
+        """service -> {state, health, restarts} for the dashboard's container table (restarts summed over replicas)."""
+        return self._services()
 
     def poll_once(self) -> None:
         now = time.time()
-        for c in self.client.containers.list(all=True, filters={"label": self.label}):
-            c.reload()
-            svc = c.labels.get("com.docker.compose.service", c.name)
-            st = c.attrs.get("State", {})
-            current = {
-                "state": st.get("Status", "unknown"),
-                "restart_count": str(c.attrs.get("RestartCount", 0)),
-            }
-            if st.get("Health"):
-                current["health"] = st["Health"].get("Status", "unknown")
+        for svc, v in self._services().items():
+            current = {"state": v["state"], "restart_count": str(v["restarts"])}
+            if v["health"] is not None:
+                current["health"] = v["health"]
             for kind, value in current.items():
                 if self._last.get((svc, kind)) != value:
                     self._last[(svc, kind)] = value

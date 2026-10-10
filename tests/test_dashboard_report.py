@@ -102,7 +102,7 @@ def test_report_routes_enforce_the_same_host_check(web):  # noqa: F811
 def test_page_wires_the_results_panels_to_the_report_script_and_endpoint(web):  # noqa: F811
     status, page = call(web.port, "GET", "/")
     assert status == 200 and 'src="/report.js"' in page and "/api/report" in page
-    for needle in ('id="r_score"', 'id="r_hist"', 'id="r_find"', 'href="/report.html"', 'href="/report.md"', 'href="/report.json"',
+    for needle in ('id="r_score"', 'id="r_hist"', 'id="r_find"', 'id="r_fix"', "ChaosReport.fixesHtml", 'href="/report.html"', 'href="/report.md"', 'href="/report.json"',
                    "ChaosReport.scoreHtml", "ChaosReport.historyHtml", "ChaosReport.findingsHtml", "ChaosReport.cardHtml"):
         assert needle in page, needle
     s, h, js = raw_get(web.port, "/report.js")

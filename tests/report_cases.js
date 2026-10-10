@@ -79,6 +79,41 @@ const cases = {
     yes(!all.includes('<img') && !all.includes('<script>') && !all.includes('</pre><script'), 'no raw markup survives');
     yes(all.includes('&lt;img src=x onerror=alert(1)&gt;') && all.includes('&lt;/pre&gt;&lt;script&gt;'));
   },
+  fix_validation_shows_the_before_and_after_table_the_verdict_and_the_sandbox_state() {
+    const r = report();
+    r.fix_validations = [{ status: 'improved', title: 'Run three worker replicas', addresses: 'Single worker', detail: 'the score rose +3.3 points',
+      change: 'docker compose up -d --scale worker=3 worker', claim: 'resilience score 93.8 -> 97.1', kept: false, reverted: true,
+      before: { score: 93.8 }, after: { score: 97.1 },
+      comparison: [{ label: 'redis queue peak', unit: 'votes', before: 109, after: 9, change_pct: -91.7, verdict: 'better' },
+                   { label: 'worst journey error rate', unit: '%', before: 0, after: 0, change_pct: 0, verdict: 'same' },
+                   { label: 'recovery time', unit: 's', before: 12, after: 40, change_pct: 233, verdict: 'worse' }] }];
+    const h = R.fixesHtml(r);
+    yes(h.includes('class="sev low">IMPROVED<') && h.includes('Run three worker replicas') && h.includes('measured improvement') && h.includes('addresses: Single worker'));
+    yes(h.includes('redis queue peak (votes)') && h.includes('<td>109.0</td><td>9.0</td>') && h.includes('-92% better') && h.includes('class="ok"'), 'the metric row');
+    yes(h.includes('<b>resilience score</b></td><td>93.8</td><td>97.1</td>') && h.includes('+233% worse') && h.includes('class="bad"'), 'score row and a regression shown as worse');
+    yes(h.includes('0% same') && h.includes('resilience score 93.8 -&gt; 97.1') && h.includes('sandbox afterwards: reverted to the original'));
+  },
+  fix_validation_words_each_status_and_each_sandbox_state_honestly() {
+    const fx = (o) => Object.assign({ status: 'improved', title: 't', detail: 'd', change: 'c', comparison: [], reverted: false, kept: false }, o);
+    const html = (o) => R.fixesHtml({ fix_validations: [fx(o)], score: {} });
+    yes(html({ status: 'inconclusive' }).includes('no measurable improvement (not claimed)') && html({ status: 'inconclusive' }).includes('class="sev medium">INCONCLUSIVE<'));
+    yes(html({ status: 'worse' }).includes('made things worse') && html({ status: 'worse' }).includes('class="sev high">WORSE<'));
+    yes(html({ status: 'error' }).includes('class="sev high">ERROR<') && html({ status: 'skipped' }).includes('skipped, nothing changed'));
+    yes(html({ kept: true }).includes('kept as changed') && html({}).includes('sandbox afterwards: not changed') && html({ reverted: true }).includes('reverted to the original'));
+  },
+  fix_validation_without_any_fix_explains_what_the_fixing_agent_does() {
+    ['', { empty: true }, null, { fix_validations: [] }].forEach(function (rep) {
+      const h = R.fixesHtml(rep);
+      yes(h.includes('No fix has been validated yet') && h.includes('chaos fix') && h.includes('chaos pipeline') && h.includes('puts the sandbox back'));
+    });
+  },
+  fix_validation_escapes_everything_it_shows() {
+    const bad = '<img src=x onerror=alert(1)>';
+    const h = R.fixesHtml({ fix_validations: [{ status: bad, title: bad, addresses: bad, detail: bad, change: bad, claim: bad, kept: false, reverted: true,
+      before: { score: 1 }, after: { score: 2 }, comparison: [{ label: bad, unit: bad, before: 1, after: 2, change_pct: 100, verdict: bad }] }] });
+    yes(!h.includes('<img') && !h.includes('<script'), 'no raw markup survives');
+    yes(h.includes('&lt;img src=x onerror=alert(1)&gt;'));
+  },
   card_summarises_the_score_for_the_header_row() {
     const c = R.cardHtml(report());
     eq([c.label, c.value, c.unit, c.tone, c.detail], ['Resilience score', '81.4', '/ 100', 'warn', 'fair']);

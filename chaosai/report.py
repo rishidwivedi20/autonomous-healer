@@ -25,7 +25,25 @@ LIMITATIONS = [
     "User impact is measured with HTTP probes (5 requests/s per journey); the pipeline is measured with the redis queue length and the Postgres row count. Anything not measured is listed as missing, not guessed.",
     "Causes marked as inference are consistent with the measurements but were not observed directly.",
     "Vote loss is not reconciled end to end yet: accepted votes are not compared with stored votes in every run.",
+    "A fix is judged on one run of the verification experiment before the change and one after it; a measured improvement needs both a score gain and a gain in the fix's own metric, and anything less is reported as not claimed.",
 ]
+
+FIX_STATUS = {"improved": "measured improvement", "inconclusive": "no measurable improvement (not claimed)", "worse": "made things worse",
+              "skipped": "skipped, nothing changed", "stopped": "stopped", "error": "error", "planned": "planned"}
+
+
+def load_fixes(results_dir: Path | str, limit: int = 5) -> list[dict]:
+    """The most recent fix validations (results/fixes/*.json, written by the fixing agent), newest first. Unreadable files are skipped."""
+    d = Path(results_dir) / "fixes"
+    out = []
+    for f in sorted(d.glob("*.json"), reverse=True) if d.exists() else []:
+        try:
+            out.append(json.loads(f.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            continue
+        if len(out) >= limit:
+            break
+    return out
 
 
 # ------------------------------------------------------------------ building
@@ -71,7 +89,7 @@ def _verification(evidence_ids: list[str], rows: dict[str, dict]) -> list[dict]:
 
 
 def build(ev, analysis: Analysis, graph: Optional[Graph] = None, scope: Optional[list[str]] = None,
-          now: Optional[float] = None) -> dict:
+          now: Optional[float] = None, validations: Optional[list[dict]] = None) -> dict:
     results = ev.results()
     ids = [i for i in (scope or ev.ids()) if i in results]
     scores = [score_experiment(results[i], graph, ev.restarts_of(i)) for i in ids]
@@ -97,6 +115,7 @@ def build(ev, analysis: Analysis, graph: Optional[Graph] = None, scope: Optional
         "experiments": [rows[i] for i in ids], "weaknesses": weaknesses, "fixes": fixes,
         "dependency_graph": ({"critical_path": graph.critical_path,
                               "depends_on": {n: s.depends_on for n, s in graph.services.items()}} if graph else None),
+        "fix_validations": load_fixes(ev.dir) if validations is None else validations,
         "limitations": LIMITATIONS,
     }
 
@@ -141,6 +160,19 @@ def to_markdown(rep: dict) -> str:
             L.append("Verify by re-running:")
             L += [f"- `{v['command']}`: was {_num(v['score_before'], '', 1)}; {v['pass_if']}" for v in f["verification"]]
             L.append("")
+    if rep.get("fix_validations"):
+        L += ["## Fix validation: before and after", "",
+              "Each fix was applied to the sandbox, the same experiment was run before and after, and the change was reverted unless stated.", ""]
+        for fx in rep["fix_validations"]:
+            L += [f"### {fx['title']}: {FIX_STATUS.get(fx['status'], fx['status'])}", "",
+                  f"Addresses: {fx.get('addresses') or '-'}. Change: `{fx['change']}`", "", fx["detail"], ""]
+            if fx.get("comparison"):
+                L += ["| Metric | Before | After | Change |", "|---|---|---|---|"]
+                L += [f"| {c['label']}{' (' + c['unit'] + ')' if c['unit'] else ''} | {_num(c['before'], '', 1) if c['before'] is not None else 'n/a'} | "
+                      f"{_num(c['after'], '', 1) if c['after'] is not None else 'n/a'} | {'' if c['change_pct'] is None else format(c['change_pct'], '+.0f') + '%'} ({c['verdict']}) |"
+                      for c in fx["comparison"]]
+                L += ["", fx.get("claim", ""), ""]
+            L += ["Sandbox afterwards: " + ("kept as changed" if fx.get("kept") else "reverted to the original" if fx.get("reverted") else "not changed"), ""]
     L += ["## Experiments", "", "| Experiment | Target | Fault | Score | Worst journey errors | Recovery | Aborted | Restarts |",
           "|---|---|---|---|---|---|---|---|"]
     for r in rep["experiments"]:
@@ -206,6 +238,19 @@ def to_html(rep: dict) -> str:
             h.append("<p>Verify by re-running:</p><ul>" + "".join(
                 f"<li><code>{e(v['command'])}</code>: was {_num(v['score_before'], '', 1)}; {e(v['pass_if'])}" for v in f["verification"]) + "</ul>")
         h.append("</div>")
+    if rep.get("fix_validations"):
+        h.append("<h2>Fix validation: before and after</h2><p class=mut>Each fix was applied to the sandbox, the same experiment was run before and after, "
+                 "and the change was reverted unless stated.</p>")
+        for fx in rep["fix_validations"]:
+            tone = {"improved": "good", "worse": "poor", "error": "poor"}.get(fx["status"], "fair")
+            h.append(f"<div class=card><h3>{e(fx['title'])}: <span class={tone}>{e(FIX_STATUS.get(fx['status'], fx['status']))}</span></h3>"
+                     f"<p class=mut>Addresses: {e(fx.get('addresses') or '-')}. Change: <code>{e(fx['change'])}</code></p><p>{e(fx['detail'])}</p>")
+            if fx.get("comparison"):
+                h.append("<table><tr><th>Metric<th>Before<th>After<th>Change</tr>" + "".join(
+                    f"<tr><td>{e(c['label'] + (' (' + c['unit'] + ')' if c['unit'] else ''))}<td>{_num(c['before'], '', 1)}<td>{_num(c['after'], '', 1)}"
+                    f"<td>{'' if c['change_pct'] is None else e(format(c['change_pct'], '+.0f') + '%')} ({e(c['verdict'])})</tr>" for c in fx["comparison"]) + "</table>"
+                         f"<p>{e(fx.get('claim', ''))}</p>")
+            h.append("<p class=mut>Sandbox afterwards: " + ("kept as changed" if fx.get("kept") else "reverted to the original" if fx.get("reverted") else "not changed") + "</p></div>")
     h.append("<h2>Experiments</h2><table><tr><th>Experiment<th>Target<th>Fault<th>Score<th>Worst journey errors<th>Recovery<th>Aborted<th>Restarts</tr>")
     for r in rep["experiments"]:
         rec = _num(r["recovery_s"], " s") if r["recovered"] else "not recovered"
@@ -238,7 +283,9 @@ class Live:
         self.builds = 0
 
     def _signature(self) -> tuple:
-        return tuple((p.name, p.stat().st_mtime_ns) for p in sorted(self.dir.glob("*.json")) if p.name not in self.SKIP)
+        files = [(p.name, p.stat().st_mtime_ns) for p in sorted(self.dir.glob("*.json")) if p.name not in self.SKIP]
+        files += [("fixes/" + p.name, p.stat().st_mtime_ns) for p in sorted((self.dir / "fixes").glob("*.json"))]       # a new fix validation changes the report too
+        return tuple(files)
 
     def _build(self) -> dict:
         from .evidence import Evidence

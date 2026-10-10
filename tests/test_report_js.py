@@ -29,6 +29,10 @@ NAMES = [
     "missing_signals_and_rollback_errors_are_surfaced_in_the_breakdown",
     "findings_show_severity_evidence_and_the_fix_with_its_verification",
     "hostile_text_from_results_or_the_analyzer_is_escaped_everywhere",
+    "fix_validation_shows_the_before_and_after_table_the_verdict_and_the_sandbox_state",
+    "fix_validation_words_each_status_and_each_sandbox_state_honestly",
+    "fix_validation_without_any_fix_explains_what_the_fixing_agent_does",
+    "fix_validation_escapes_everything_it_shows",
     "card_summarises_the_score_for_the_header_row",
 ]
 

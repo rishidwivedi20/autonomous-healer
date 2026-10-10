@@ -310,3 +310,84 @@ def test_a_healthy_probe_never_resets_its_client(store, server):
     time.sleep(1.0)
     p.stop()
     assert p.client_resets == 0
+
+
+# ---- a service with several replicas (the fixing agent scales the worker to three)
+from chaosai.observer import combine_health, combine_state, restart_counts      # noqa: E402
+
+
+def replica(svc, cid, **kw):
+    c = FakeContainer(svc, **kw)
+    c.id = c.name = cid
+    return c
+
+
+class FlappingClient(FakeClient):
+    """Returns the containers in a different order on every call, as Docker's listing may."""
+    def __init__(self, *cs):
+        super().__init__(*cs)
+        self.calls = 0
+
+    def list(self, all=False, filters=None):
+        self.calls += 1
+        items = list(self.cs.values())
+        return items if self.calls % 2 else items[::-1]
+
+
+def test_replicas_with_different_restart_counts_do_not_look_like_restarts(store):
+    """Seen live: one old worker container (2 restarts) and two new ones (0) made the watcher record 0, 2, 0, 2 ... on every poll,
+    which the report showed as 46 restarts of the worker."""
+    c = FlappingClient(replica("worker", "w1", health=None, restarts=2), replica("worker", "w2", health=None, restarts=0),
+                       replica("worker", "w3", health=None, restarts=0))
+    w = DockerWatcher(store, client=c)
+    for _ in range(6):
+        w.poll_once()
+    evs = [(e.kind, e.value) for e in events(store, 0, time.time() + 1, "worker")]
+    assert evs == [("state", "running"), ("restart_count", "2")]                    # one snapshot, then silence
+    assert restart_counts(store, 0, time.time() + 1) == {}
+
+
+def test_scaling_up_adds_no_event_and_a_real_restart_of_one_replica_is_seen(store):
+    w1, w2 = replica("worker", "w1", health=None), replica("worker", "w2", health=None)
+    client = FakeClient(w1)
+    w = DockerWatcher(store, client=client)
+    w.poll_once()
+    client.cs["w2"] = w2                                                              # scaled from one replica to two
+    w.poll_once()
+    assert [(e.kind, e.value) for e in events(store, 0, time.time() + 1, "worker")] == [("state", "running"), ("restart_count", "0")]
+    w2.restarts = 1                                                                   # one replica really restarted
+    w.poll_once()
+    assert ("restart_count", "1") in [(e.kind, e.value) for e in events(store, 0, time.time() + 1, "worker")]
+    assert restart_counts(store, 0, time.time() + 1) == {"worker": 1}
+
+
+def test_scaling_down_never_counts_as_a_restart(store):
+    w1, w2 = replica("worker", "w1", health=None, restarts=0), replica("worker", "w2", health=None, restarts=3)
+    client = FakeClient(w1, w2)
+    w = DockerWatcher(store, client=client)
+    w.poll_once()
+    del client.cs["w2"]                                                               # the busy replica is removed: the sum drops 3 -> 0
+    w.poll_once()
+    assert restart_counts(store, 0, time.time() + 1) == {}
+
+
+def test_table_and_snapshot_combine_replicas(store):
+    c = FakeClient(replica("worker", "w1", health=None, restarts=2), replica("worker", "w2", health=None, restarts=1, status="exited"),
+                   FakeContainer("db", health="starting"))
+    w = DockerWatcher(store, client=c)
+    assert w.table()["worker"] == {"state": "exited", "health": None, "restarts": 3}
+    assert w.snapshot()["worker"] == ("exited", None) and unhealthy(w.snapshot()) == ["db", "worker"]
+
+
+@pytest.mark.parametrize("states,expected", [(["running"], "running"), (["running", "running"], "running"), (["running", "exited"], "exited"),
+                                             (["paused", "running"], "paused"), (["restarting", "paused"], "restarting"), (["created", "running"], "created"),
+                                             (["running", "weird"], "weird"), (["dead", "exited"], "dead")])
+def test_combine_state_is_running_only_if_every_replica_is(states, expected):
+    assert combine_state(states) == expected
+
+
+@pytest.mark.parametrize("healths,expected", [([None, None], None), ([], None), (["healthy"], "healthy"), (["healthy", "healthy"], "healthy"),
+                                              (["healthy", "unhealthy"], "unhealthy"), (["starting", "healthy"], "starting"),
+                                              (["starting", "unhealthy"], "unhealthy"), (["healthy", None], "healthy")])
+def test_combine_health_prefers_the_worst_known_health(healths, expected):
+    assert combine_health(healths) == expected

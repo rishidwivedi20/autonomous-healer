@@ -23,6 +23,8 @@ from . import analyzer as analyzer_mod
 from . import discovery, planner
 from . import report as report_mod
 from .evidence import Evidence
+from .finder import FindingAgent, FindingError
+from . import fixer as fixer_mod
 from .agent import InjectorAgent
 from .injector import InjectionError
 from .models import Experiment, Graph, Thresholds
@@ -526,22 +528,17 @@ def analyze(ids: list[str] = typer.Option(None, "--id", "-i", help="experiment i
 
 
 # ------------------------------------------------------------------ report / autopilot
-def make_report(c: config_mod.Config, scope: list[str] | None, offline: bool, compose: Path):
-    """Analyze the stored experiments, score them, and write results/findings.{json,md,html}."""
-    ev = Evidence(RESULTS)
-    ids = ev.ids() if scope is None else [i for i in scope if i in ev.ids()]
-    if not ids:
-        fail("no stored experiments to report on; run `chaos autopilot` (or `chaos agent`) first", 1)
+def make_report(c: config_mod.Config, scope: list[str] | None, offline: bool, compose: Path, analysis=None):
+    """Run the finding agent: analyze the stored experiments, score them, and write results/findings.{json,md,html}."""
+    finder = FindingAgent(c.analyzer, RESULTS, load_graph(compose), use_llm=not offline, cache_dir=RESULTS / "llm_cache")
     try:
-        analysis = analyzer_mod.analyze(ev, ids, c.analyzer, use_llm=not offline, cache_dir=RESULTS / "llm_cache")
-    except analyzer_mod.AnalyzerError as e:
+        found = finder.run(scope, analysis)
+    except FindingError as e:
         fail(str(e), 1)
-    (RESULTS / "analysis.json").write_text(analysis.model_dump_json(indent=2), encoding="utf-8")
-    rep = report_mod.build(ev, analysis, load_graph(compose), ids)
-    paths = report_mod.write(RESULTS, rep)
+    analysis, rep, paths = found.analysis, found.report, found.paths
     sc = rep["score"]
     how = f"LLM agent ({analysis.model})" if analysis.generated_by == "llm" else "deterministic rules"
-    typer.echo(f"\n{len(ids)} experiment(s), analysis by {how}")
+    typer.echo(f"\n{len(found.ids)} experiment(s), analysis by {how}")
     if analysis.fallback_reason:
         typer.secho(f"  rule-based fallback because: {analysis.fallback_reason}", fg=typer.colors.YELLOW)
     if sc["score"] is None:
@@ -553,7 +550,7 @@ def make_report(c: config_mod.Config, scope: list[str] | None, offline: bool, co
         typer.echo(f"  {n}. [{w['severity'].upper()}] {w['title']}")
     for kind in ("md", "html", "json"):
         typer.echo(f"saved {paths[kind]}")
-    return rep
+    return found
 
 
 @app.command()
@@ -594,6 +591,233 @@ def autopilot(top: int = typer.Option(None, "--top", "-n", help="experiments to 
     typer.echo("\nanalyzing, scoring and writing the report ...")
     make_report(c, done, offline, compose)
     if run.status == "stopped":
+        raise typer.Exit(1)
+
+
+# ------------------------------------------------------------------ the fixing agent, and all three agents together
+def build_fixing_agent(c: config_mod.Config, live, graph: Graph, compose_path: Path) -> fixer_mod.FixingAgent:
+    """The fixing agent wired to the live sandbox. Its verification runs use their own Orchestrator (same store, injector and guard,
+    different results folder), so they never mix into results/*.json, the experiment history the score is computed from."""
+    client = live.injector.client
+    compose = fixer_mod.ComposeRunner(compose_path, set(live.injector.list_targets()), timeout_s=c.fixer.compose_timeout_s)
+
+    def replicas(service: str) -> int:
+        return len(client.containers.list(filters={"label": [f"com.docker.compose.service={service}", "chaosai.managed=true"], "status": "running"}))
+
+    def orch_factory(results_dir: Path):
+        return Orchestrator(live.store, live.injector, live.guard, results_dir, health_fn=live.health,
+                            settle_s=live.probe.cfg.timeout_s + 0.5, **orchestrator_kwargs(c))
+
+    return fixer_mod.FixingAgent(orch_factory, compose, replicas, live.health, live.guard, graph, c.fixer, RESULTS,
+                                 c.experiment.baseline_s, c.experiment.recovery_timeout_s, default_thresholds(c),
+                                 probe_interval_s=live.probe.cfg.interval_s,
+                                 gauges_fn=lambda d, i: Evidence(d, store=live.store).get_gauges(i),
+                                 state_path=RESULTS / "active_fixes.json", log=typer.echo)
+
+
+def plan_fix(c: config_mod.Config, graph: Graph, compose: Path, recipe_id: str, weakness: str, keep: bool) -> fixer_mod.FixRun:
+    """The dry run of the fixing agent: needs no Docker. The allowlist comes from the compose file's labels."""
+    orch, guard = offline_orchestrator(c)
+    agent_ = fixer_mod.FixingAgent(lambda d: orch, fixer_mod.ComposeRunner(compose, set(guard.managed_targets)), lambda s: 1, lambda: [], guard,
+                                   graph, c.fixer, RESULTS, c.experiment.baseline_s, c.experiment.recovery_timeout_s, default_thresholds(c),
+                                   probe_interval_s=c.probe.interval_s)
+    try:
+        return agent_.run(recipe_id, weakness, keep=keep or None, dry_run=True)
+    except (fixer_mod.FixError, SafetyViolation) as e:
+        fail(str(e))
+
+
+def print_fix(run: fixer_mod.FixRun) -> None:
+    colors = {"improved": typer.colors.GREEN, "worse": typer.colors.RED, "error": typer.colors.RED, "stopped": typer.colors.YELLOW}
+    typer.secho(f"\nFIX {run.recipe_id}: {run.status.upper()}", fg=colors.get(run.status), bold=True)
+    typer.echo(f"  {run.title}   ({run.change})")
+    if run.addresses:
+        typer.echo(f"  addresses: {run.addresses}")
+    typer.echo(f"  {run.detail}")
+    for n in run.notes:
+        typer.echo(f"  {n}")
+    if run.comparison:
+        typer.echo(f"\n  {'metric':<42}{'before':>11}{'after':>11}{'change':>10}")
+        for r in run.comparison:
+            cell = lambda v: "n/a" if v is None else f"{v:g}"
+            chg = "" if r["change_pct"] is None else f"{r['change_pct']:+.0f}%"
+            typer.echo(f"  {r['label'] + (' (' + r['unit'] + ')' if r['unit'] else ''):<42}{cell(r['before']):>11}{cell(r['after']):>11}{chg:>10}  {r['verdict']}")
+        typer.echo(f"\n  {run.claim}")
+    if run.status in ("improved", "inconclusive", "worse", "error", "stopped") and (run.reverted or run.kept or run.revert_errors):
+        typer.echo("  sandbox: " + ("kept as changed (undo with `chaos fix --revert`)" if run.kept else
+                                    "reverted to the original" if run.reverted else "NOT reverted: " + "; ".join(run.revert_errors)))
+
+
+def revert_pending_fixes(c: config_mod.Config, include_kept: bool = False) -> list[str]:
+    """Undo fixes recorded as applied (a crashed run, or `chaos fix --keep`). Used by `chaos reset`, `chaos abort` and `chaos fix --revert`."""
+    state = RESULTS / "active_fixes.json"
+    if not state.exists():
+        return []
+    try:
+        injector = make_injector()
+        guard = Guard(set(injector.list_targets()), kill_switch(), c.safety.max_duration_s, lock=ExperimentLock(RESULTS / "experiment.lock"))
+    except Exception as e:
+        return [f"could not reach Docker to revert fixes: {e}"]
+    client = injector.client
+    replicas = lambda service: len(client.containers.list(filters={"label": [f"com.docker.compose.service={service}", "chaosai.managed=true"], "status": "running"}))
+    agent_ = fixer_mod.FixingAgent(lambda d: None, fixer_mod.ComposeRunner(COMPOSE, set(guard.managed_targets), timeout_s=c.fixer.compose_timeout_s),
+                                   replicas, lambda: [], guard, None, c.fixer, RESULTS, c.experiment.baseline_s, c.experiment.recovery_timeout_s,
+                                   default_thresholds(c), state_path=state, log=typer.echo)
+    return agent_.revert_pending(include_kept)
+
+
+@app.command()
+def fix(recipe: str = typer.Option(None, "--recipe", "-r", help="which vetted fix to apply (see --list); default: the first one the findings call for"),
+        list_fixes: bool = typer.Option(False, "--list", help="show the catalogue of vetted fixes and exit"),
+        revert: bool = typer.Option(False, "--revert", help="undo every fix recorded as applied (including ones kept with --keep) and exit"),
+        keep: bool = typer.Option(False, "--keep", help="keep the fix if it is measured to help (default: always put the sandbox back)"),
+        offline: bool = typer.Option(False, help="choose the fix from the rule-based analysis (no LLM)"),
+        dry_run: bool = typer.Option(False, help="show the plan; change nothing"),
+        yes: bool = typer.Option(False, "--yes", "-y", help="do not ask for confirmation"),
+        compose: Path = typer.Option(COMPOSE)):
+    """The fixing agent: apply one vetted fix, run the same experiment before and after, compare, and put things back."""
+    c = cfg()
+    if list_fixes:
+        for r in fixer_mod.CATALOG.values():
+            v = r.verify
+            typer.echo(f"{r.id}: {r.title}\n    changes:  {r.change}\n    why:      {r.why}\n    proven by: {v['fault']} on {v['target']} at {v['votes_per_s']} votes/s for {v['duration_s']}s, "
+                       f"before and after; judged on {fixer_mod.METRICS[r.primary][0]} and the resilience score")
+        return
+    if revert:
+        errors = revert_pending_fixes(c, include_kept=True)
+        if errors:
+            fail("revert problems:\n  " + "\n  ".join(errors), 1)
+        typer.echo("every recorded fix is reverted")
+        return
+    graph = load_graph(compose)
+    weakness = ""
+    if not recipe:
+        finder = FindingAgent(c.analyzer, RESULTS, graph, use_llm=not offline, cache_dir=RESULTS / "llm_cache")
+        try:
+            picks = fixer_mod.FixingAgent.select(finder.analyze(None))
+        except FindingError as e:
+            fail(str(e), 1)
+        if not picks:
+            fail("no vetted fix matches the findings (name one with --recipe; see --list)", 1)
+        chosen, w = picks[0]
+        recipe, weakness = chosen.id, w.title
+        typer.echo(f"the findings call for: {chosen.title}   (addresses: {w.title})")
+    if dry_run:
+        print_plan_of_fix(plan_fix(c, graph, compose, recipe, weakness, keep))
+        return
+    spec = fixer_mod.CATALOG.get(recipe)
+    if spec is None:
+        fail(f"unknown fix {recipe!r}; the catalogue has: {', '.join(fixer_mod.CATALOG)}")
+    typer.echo(f"\nThe fixing agent will run {spec.verify['fault']} on {spec.verify['target']} twice (before and after) and change the sandbox "
+               f"in between: {spec.change}. It puts the original back afterwards" + (" unless the fix helps (--keep)." if keep else "."))
+    if not yes and not typer.confirm("Continue?"):
+        fail("cancelled; nothing changed", 1)
+    live = start_live(c, kill_switch())
+    try:
+        run = build_fixing_agent(c, live, graph, compose).run(recipe, weakness, keep=True if keep else None)
+    except (fixer_mod.FixError, SafetyViolation) as e:
+        fail(str(e), 1)
+    except BaseException:
+        errors = live.injector.restore_all()                     # last line of defense; never leave a fault behind
+        typer.secho(f"fixing agent interrupted; restore_all errors: {errors or 'none'}; undo any fix with `chaos fix --revert`", fg=typer.colors.RED, err=True)
+        raise
+    finally:
+        live.stop()
+    print_fix(run)
+    typer.echo(f"saved {RESULTS / 'fixes' / (run.id + '.json')}")
+    if run.status in ("stopped", "error") or run.revert_errors:
+        raise typer.Exit(1)
+
+
+def print_plan_of_fix(run: fixer_mod.FixRun) -> None:
+    typer.echo(f"\nDRY RUN of the fixing agent: {run.title} ({run.change})")
+    if run.addresses:
+        typer.echo(f"  addresses: {run.addresses}")
+    for n in run.notes:
+        typer.echo(f"  {n}")
+    typer.echo("  nothing was changed")
+
+
+@app.command()
+def pipeline(top: int = typer.Option(None, "--top", "-n", help="experiments to plan (default: planner.top)"),
+             max_experiments: int = typer.Option(None, "--max", help="cap on experiments actually run (default: agent.max_experiments)"),
+             offline: bool = typer.Option(False, help="no LLM anywhere: heuristic planner, rule-based analyzer (works with no API key)"),
+             dry_run: bool = typer.Option(False, help="plan everything and change nothing"),
+             no_fix: bool = typer.Option(False, "--no-fix", help="stop after the finding agent"),
+             keep_fix: bool = typer.Option(False, "--keep-fix", help="keep the fix if it is measured to help (default: put the sandbox back)"),
+             yes: bool = typer.Option(False, "--yes", "-y", help="do not ask for confirmation"),
+             compose: Path = typer.Option(COMPOSE)):
+    """All three agents, hands-off: INJECT faults, FIND the weaknesses, FIX the top one and prove it with the same experiment."""
+    c = cfg()
+    graph = load_graph(compose)
+    if dry_run:
+        typer.secho("== AGENT 1/3: INJECTING (plan) ==", bold=True)
+        agent(top=top, max_experiments=max_experiments, offline=offline, dry_run=True, yes=True, compose=compose)
+        if not no_fix:
+            typer.secho("\n== AGENT 3/3: FIXING (plan) ==", bold=True)
+            r = next(iter(fixer_mod.CATALOG.values()))
+            typer.echo("(the fix is chosen from the findings once the experiments have run; this is the first one in the catalogue)")
+            print_plan_of_fix(plan_fix(c, graph, compose, r.id, "", keep_fix))
+        return
+    result, n_history = make_plan(c, top, offline, compose)
+    print_plan(result, n_history)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    exps = [e.model_copy(update={"thresholds": default_thresholds(c)}) for e in planner.to_experiments(result, stamp)]
+    acfg = c.agent.model_copy(update={"max_experiments": max_experiments or c.agent.max_experiments})
+    n_run = min(len(exps), acfg.max_experiments)
+    typer.echo(f"\nPIPELINE: the injecting agent will inject {n_run} fault(s) one at a time into containers labeled chaosai.managed=true on this machine; "
+               "the finding agent will analyze and score them; "
+               + ("" if no_fix else "the fixing agent will then apply one vetted fix, re-run the same experiment, compare, and put things back. ")
+               + "Kill switch: Ctrl+C or `chaos abort`.")
+    if not yes and not typer.confirm("Continue?"):
+        fail("cancelled; nothing injected", 1)
+
+    typer.secho("\n== AGENT 1/3: INJECTING ==", bold=True)
+    run = execute_agent(c, exps, acfg, result.planner, stamp)
+    done = [e.id for e in run.entries if e.status == "done"]
+    if not done:
+        fail("the injecting agent ran no experiments, so there is nothing to analyze", 1)
+
+    typer.secho("\n== AGENT 2/3: FINDING ==", bold=True)
+    found = make_report(c, done, offline, compose)
+
+    fix_run = None
+    if not no_fix and run.status != "stopped":
+        typer.secho("\n== AGENT 3/3: FIXING ==", bold=True)
+        picks, note = fixer_mod.FixingAgent.select(found.analysis), ""
+        if not picks:                                           # this run may not have exercised a weakness the catalogue can fix
+            try:
+                picks = fixer_mod.FixingAgent.select(FindingAgent(c.analyzer, RESULTS, graph, cache_dir=RESULTS / "llm_cache").rules_over_history())
+                note = "  (found in the stored history: this run's experiments did not exercise it)"
+            except FindingError:
+                picks = []
+        if not picks:
+            typer.echo("no vetted fix matches the findings, so nothing is changed")
+        else:
+            recipe, weakness = picks[0]
+            typer.echo(f"fixing: {recipe.title}   (addresses: {weakness.title}){note}")
+            live = start_live(c, kill_switch())
+            try:
+                fix_run = build_fixing_agent(c, live, graph, compose).run(recipe.id, weakness.title, keep=True if keep_fix else None)
+            except (fixer_mod.FixError, SafetyViolation) as e:
+                typer.secho(f"the fixing agent could not run: {e}", fg=typer.colors.RED)
+            finally:
+                live.stop()
+            if fix_run:
+                print_fix(fix_run)
+                typer.echo("\nupdating the report with the validated fix ...")
+                make_report(c, done, offline, compose, analysis=found.analysis)
+
+    typer.secho("\n== SUMMARY ==", bold=True)
+    done_entries = [e for e in run.entries if e.status == "done"]
+    typer.echo(f"injecting: {len(done_entries)} experiment(s) run, {sum(e.aborted for e in done_entries)} auto-aborted, "
+               f"{sum(bool(e.recovered) for e in done_entries)} recovered" + (f"; stopped: {run.stop_reason}" if run.stop_reason else ""))
+    sc = found.report["score"]
+    typer.echo(f"finding:   {len(found.analysis.weaknesses)} weakness(es), resilience score "
+               + ("n/a" if sc["score"] is None else f"{sc['score']:.1f}/100 ({sc['band']})") + f", analysis by {found.analysis.generated_by}")
+    typer.echo("fixing:    " + ("skipped" if fix_run is None else f"{fix_run.recipe_id} -> {fix_run.status}: {fix_run.claim or fix_run.detail}"))
+    typer.echo(f"report:    {found.paths['html']}")
+    if run.status == "stopped" or (fix_run and (fix_run.status in ("stopped", "error") or fix_run.revert_errors)):
         raise typer.Exit(1)
 
 
@@ -712,6 +936,7 @@ def abort():
         errors = make_injector().restore_all()
     except Exception as e:
         fail(f"kill switch is set, but I could not reach Docker to restore state: {e}", 1)
+    errors += revert_pending_fixes(cfg())               # a fix applied by the fixing agent is undone too (kept fixes are not)
     if errors:
         fail("restore problems:\n  " + "\n  ".join(errors), 1)
     typer.echo("all faults undone; managed containers running")
@@ -724,6 +949,7 @@ def reset():
         errors = make_injector().restore_all()
     except Exception as e:
         fail(f"cannot reach Docker, kill switch left engaged: {e}", 1)
+    errors += revert_pending_fixes(cfg())               # a fix applied by the fixing agent is undone too (kept fixes are not)
     if errors:
         fail("not clearing the kill switch; restore problems:\n  " + "\n  ".join(errors), 1)
     kill_switch().reset()

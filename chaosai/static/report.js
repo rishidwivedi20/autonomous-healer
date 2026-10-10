@@ -82,6 +82,32 @@
     return '<h3>Ranked weaknesses</h3>' + (ws || '<div class="mut">none</div>') + '<h3>Recommended fixes</h3>' + (fx || '<div class="mut">none</div>');
   }
 
+  /* ---- fix validation: what the fixing agent changed, the same experiment before and after, and the measured verdict */
+  const FIX_STATUS = { improved: 'measured improvement', inconclusive: 'no measurable improvement (not claimed)', worse: 'made things worse',
+                       skipped: 'skipped, nothing changed', stopped: 'stopped', error: 'error', planned: 'planned' };
+  function fixesHtml(rep) {
+    const none = '<div class="mut">No fix has been validated yet. Run <code>chaos fix</code> or <code>chaos pipeline</code>: the fixing agent applies one ' +
+      'vetted fix, runs the same experiment before and after, compares the two, and puts the sandbox back.</div>';
+    if (!rep || rep.empty || !rep.fix_validations || !rep.fix_validations.length) return none;
+    return rep.fix_validations.map(function (fx) {
+      const tone = fx.status === 'improved' ? 'ok' : (fx.status === 'worse' || fx.status === 'error') ? 'bad' : 'warn';
+      const rows = (fx.comparison || []).map(function (c) {
+        const t = c.verdict === 'better' ? 'ok' : c.verdict === 'worse' ? 'bad' : 'mut';
+        return '<tr><td>' + esc(c.label + (c.unit ? ' (' + c.unit + ')' : '')) + '</td><td>' + num(c.before, 1) + '</td><td>' + num(c.after, 1) + '</td><td class="' + t + '">' +
+          (c.change_pct == null ? '' : esc((c.change_pct > 0 ? '+' : '') + Math.round(c.change_pct) + '%')) + ' ' + esc(c.verdict) + '</td></tr>';
+      }).join('');
+      const b = fx.before || {}, a = fx.after || {};
+      const score = (b.score == null && a.score == null) ? '' : '<tr><td><b>resilience score</b></td><td>' + num(b.score, 1) + '</td><td>' + num(a.score, 1) + '</td><td></td></tr>';
+      return '<div class="find"><div class="fh"><span class="sev ' + (tone === 'ok' ? 'low' : tone === 'bad' ? 'high' : 'medium') + '">' + esc(String(fx.status).toUpperCase()) + '</span> <b>' +
+        esc(fx.title) + '</b></div><div class="note">' + esc(FIX_STATUS[fx.status] || fx.status) + (fx.addresses ? '; addresses: ' + esc(fx.addresses) : '') + '</div>' +
+        '<div>' + esc(fx.detail) + '</div>' +
+        (rows || score ? '<table class="hist"><thead><tr><th>metric</th><th>before</th><th>after</th><th>change</th></tr></thead><tbody>' + score + rows + '</tbody></table>' : '') +
+        (fx.claim ? '<div class="note">' + esc(fx.claim) + '</div>' : '') +
+        '<div class="note">change: <code>' + esc(fx.change) + '</code>; sandbox afterwards: ' +
+        esc(fx.kept ? 'kept as changed' : fx.reverted ? 'reverted to the original' : 'not changed') + '</div></div>';
+    }).join('');
+  }
+
   /* ---- small badge for the header cards row */
   function cardHtml(rep) {
     if (empty(rep) || rep.score.score == null) return '';
@@ -89,7 +115,7 @@
     return { label: 'Resilience score', value: num(sc.score, 1), unit: '/ 100', tone: tone(sc.band), detail: String(sc.band) };
   }
 
-  const api = { esc: esc, scoreHtml: scoreHtml, historyHtml: historyHtml, findingsHtml: findingsHtml, cardHtml: cardHtml, tone: tone };
+  const api = { esc: esc, scoreHtml: scoreHtml, historyHtml: historyHtml, findingsHtml: findingsHtml, fixesHtml: fixesHtml, cardHtml: cardHtml, tone: tone };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.ChaosReport = api;
 })(typeof window !== 'undefined' ? window : this);

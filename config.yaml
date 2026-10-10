@@ -70,6 +70,15 @@ dashboard:                   # `chaos dashboard`: live web page with an inject b
   baseline_s: 8              # steady-state window before a button-launched fault
   duration_s: 20             # how long button-launched faults run
 
+fixer:                       # the fixing agent (`chaos fix`, `chaos pipeline`)
+  keep: false                # true = keep a fix that was measured to help (default: revert, leave the sandbox as found)
+  warmup_s: 10               # let a changed service settle before the verification experiment
+  cooldown_s: 10             # pause between the before run and the change
+  health_wait_s: 90          # wait this long for the sandbox to be healthy after a change
+  compose_timeout_s: 240     # one docker compose command
+  min_score_gain: 3.0        # resilience-score points that count as a measured improvement
+  min_metric_gain: 0.25      # relative improvement of the fix's own metric that counts (0.25 = 25%)
+
 agent:                       # the injector agent (`chaos agent`)
   max_experiments: 6
   cooldown_s: 10             # pause between experiments

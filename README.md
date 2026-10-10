@@ -34,6 +34,8 @@ python -m venv .venv; .\.venv\Scripts\pip install -r requirements.txt
 | `chaos plan [--top N] [--offline] [--dry-run]` | Ranks which experiments to run first (heuristic risk score, re-ranked by Claude when `ANTHROPIC_API_KEY` is set) |
 | `chaos agent [--top N] [--max N] [--offline] [--dry-run] [-y]` | **The injector agent**: plans, then introduces the faults one at a time through the safety guard |
 | `chaos autopilot [--top N] [--max N] [--offline] [--dry-run] [-y]` | **Hands-off end to end**: plan, inject with the agent, analyze, score, and write the findings report |
+| `chaos pipeline [--top N] [--max N] [--offline] [--no-fix] [--keep-fix] [--dry-run] [-y]` | **All three agents, hands-off**: INJECT faults, FIND the weaknesses (analysis, score, report), FIX the top one and prove it with the same experiment before and after; `--offline` needs no API key |
+| `chaos fix [--recipe ID] [--list] [--keep] [--revert] [--offline] [--dry-run] [-y]` | **The fixing agent** on its own: apply one vetted fix, run the same experiment before and after, compare, put the sandbox back; `--revert` undoes anything still applied |
 | `chaos report [--last N] [--offline]` | Write `results/findings.{md,html,json}` (resilience score, ranked weaknesses, cited fixes with verification re-runs) from the stored experiments |
 | `chaos discover [--live]` | Builds the dependency map from the compose file (and running containers with `--live`) |
 | `chaos baseline --seconds N` | Observes the healthy system and saves the baseline |
@@ -43,6 +45,30 @@ python -m venv .venv; .\.venv\Scripts\pip install -r requirements.txt
 | `chaos status` | Kill switch, recorded active faults, container state |
 
 Faults: `kill`, `stop`, `pause`, `cpu-limit`, `memory-limit`, `network-delay`, `network-loss`, `traffic-spike`. Parameters via `-p key=value` (e.g. `-p latency_ms=800`, `-p cpus=0.25`, `-p mem=32m`, `-p loss_pct=40`, `-p multiplier=8`).
+
+## The three agents: inject, find, fix
+
+`chaos pipeline` runs all three hands-off, and `--offline` runs them with no API key and no network (heuristic planner, rule-based analyzer, vetted fixes). Each agent can also be run alone.
+
+| Agent | What it does | Where | With no LLM |
+|---|---|---|---|
+| **Injecting** | plans the experiments, waits for a healthy system, injects one fault at a time through the safety guard, rolls back, cools down | `agent.py`, `planner.py`, `injector.py`, `safety.py` | heuristic risk ranking |
+| **Finding** | reads the stored measurements through read-only evidence tools; ranks weaknesses by severity with cited evidence, a fix and a verification re-run for each; computes the resilience score; writes `findings.{md,html,json}` | `finder.py`, `analyzer.py`, `rules.py`, `scoring.py`, `report.py` | deterministic rule-based analyzer |
+| **Fixing** | picks a vetted fix that matches a finding, measures the problem, applies the fix, re-runs the same experiment, compares, and reverts | `fixer.py` | the catalogue and the judging are plain code |
+
+### The fixing agent, step by step
+
+1. **Choose.** It can only pick from `CATALOG` in `fixer.py`, a hard-coded list of reversible fixes (today: `scale-worker`, three worker replicas via `docker compose --scale`). A weakness selects a fix by naming the service and a matching word; an LLM (or a person) only ever supplies an id, never a command. `chaos fix --list` shows the catalogue.
+2. **Before.** It runs the fix's verification experiment (for `scale-worker`: a traffic spike on vote at 15 votes/s for 20 s, converted to a multiplier from the probe's own rate) through the normal orchestrator, safety guard and rollback, and measures it.
+3. **Check.** If the problem the fix addresses does not show up in that measurement (for `scale-worker`: the redis queue peaking at 20 votes or more), it changes nothing and says so. This is the common case on a healthy system, and it was seen live.
+4. **Apply.** It writes the undo to `results/active_fixes.json` first, takes the one-experiment-at-a-time lock, and changes the sandbox with an argument list (no shell) for services labelled `chaosai.managed=true` only, with a replica count from 1 to 5; then waits until the sandbox is healthy.
+5. **After.** The same experiment again.
+6. **Judge.** `improved` needs BOTH a resilience-score gain of at least 3 points AND a gain of at least 25% in the fix's own metric, with no score component dropping noticeably; a regression is `worse`; anything else is `inconclusive` and is **not claimed**. It is one run each, and the report says so.
+7. **Revert**, in a `finally`: the original replica count is restored and verified, unless the fix was measured to help and `--keep` was given. An error or the kill switch cannot leave the change in place; if a revert fails the undo stays on disk and `chaos reset` / `chaos abort` / `chaos fix --revert` retry it.
+
+The two verification runs are stored in `results/fix-runs/<id>/`, apart from the experiment history, so a "fixed" run never replaces the real history that the score is computed from. The validated fix is saved in `results/fixes/`, and appears in `findings.{md,html,json}` and on the dashboard ("Fix validation" panel).
+
+**A real run** (live Docker, no API key): `chaos fix --recipe scale-worker` measured the same spike before and after. Redis queue peak 109 -> 9 votes (-92%), queue back to baseline after 34.3 s -> 12.8 s, recovery time 12 s -> 0 s, other services restarted 0 -> 0, resilience score 93.8 -> 97.1: verdict *improved*, and the sandbox was put back to one worker. An earlier attempt with a smaller spike showed no backlog, and the agent correctly changed nothing.
 
 ## Using a free Gemini key instead (Google AI Studio)
 

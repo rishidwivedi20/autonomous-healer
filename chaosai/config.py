@@ -188,6 +188,17 @@ class AgentCfg(_Base):
     max_consecutive_skips: int = Field(2, ge=1)    # stop if this many experiments in a row are refused
 
 
+class FixerCfg(_Base):
+    """The fixing agent (`chaos fix`, `chaos pipeline`): applies one vetted fix, proves it with the same experiment, puts things back."""
+    keep: bool = False                                   # keep a fix that was measured to help (default: always revert, leave the sandbox as found)
+    warmup_s: float = Field(10.0, ge=0)                  # let a changed service settle before the verification experiment
+    cooldown_s: float = Field(10.0, ge=0)                # pause between the before run and the change
+    health_wait_s: float = Field(90.0, ge=1)             # how long to wait for the sandbox to be healthy after a change
+    compose_timeout_s: int = Field(240, ge=10)           # one docker compose command
+    min_score_gain: float = Field(3.0, ge=0)             # points of resilience score that count as a measured improvement
+    min_metric_gain: float = Field(0.25, ge=0, le=1)     # relative improvement of the fix's own metric that counts
+
+
 class DashboardCfg(_Base):
     port: int = Field(8765, ge=1, le=65535)
     probe_rate_per_s: float = Field(5.0, gt=0, le=50)   # requests per second per journey (faster than the CLI's 1/s so short outages show)
@@ -205,6 +216,7 @@ class Config(_Base):
     planner: PlannerCfg = Field(default_factory=PlannerCfg)
     agent: AgentCfg = Field(default_factory=AgentCfg)
     analyzer: AnalyzerCfg = Field(default_factory=AnalyzerCfg)
+    fixer: FixerCfg = Field(default_factory=FixerCfg)
     dashboard: DashboardCfg = Field(default_factory=DashboardCfg)
 
     @field_validator("faults")

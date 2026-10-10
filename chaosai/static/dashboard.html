@@ -162,6 +162,7 @@
   <div class="panel rp" style="margin-top:12px"><h2>Experiment history &middot; click a row for its score breakdown</h2><div id="r_hist" class="hist-wrap"></div></div>
   <div class="panel rp" style="margin-top:12px"><h2>Findings &middot; ranked, with the evidence behind each</h2><div id="r_find"></div>
     <div class="note">Rule-based analysis of the stored results, refreshed when an experiment finishes. Run <code>chaos report</code> (without <code>--offline</code>) for the Claude-written version.</div></div>
+  <div class="panel rp" style="margin-top:12px"><h2>Fix validation &middot; the same experiment before and after a vetted fix</h2><div id="r_fix"></div></div>
   <p class="note">Everything here is read from the live SQLite store: a synthetic user posts a vote and loads the result page <span id="rate">5</span>&times; per second. The red band is the time the fault was active; red lines mark container restarts. Latency percentiles cover successful requests only; a failed request counts toward the error rate.</p>
 </main>
 <script src="/graph.js"></script>
@@ -190,6 +191,7 @@ function drawReport() {
   $('#r_score').innerHTML = ChaosReport.scoreHtml(REPORT);
   $('#r_hist').innerHTML = ChaosReport.historyHtml(REPORT);
   $('#r_find').innerHTML = ChaosReport.findingsHtml(REPORT);
+  $('#r_fix').innerHTML = ChaosReport.fixesHtml(REPORT);
   document.querySelectorAll('#r_hist .hdetail').forEach(r => { r.hidden = !openRows.has(r.dataset.id); });
 }
 async function loadReport() {
