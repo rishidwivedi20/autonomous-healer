@@ -79,3 +79,4 @@ class ExperimentResult(BaseModel):
     restarts: dict[str, int] = Field(default_factory=dict)
     rollback_errors: list[str] = Field(default_factory=list)
     missing_signals: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)   # what the injector did / dry-run plan
