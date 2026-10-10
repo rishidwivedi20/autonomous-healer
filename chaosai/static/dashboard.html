@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>chaos-ai live</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --ink: #14181f; --muted: #5d6675; --line: #dfe3ea; --grid: #e9ecf1;
+    --vote: #2563eb; --result: #15803d; --queue: #c2570c; --votes: #7c3aed; --bad: #dc2626; --warn: #d97706; --ok: #15803d;
+    --shade: rgba(220, 38, 38, .11);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1218; --card: #171b23; --ink: #e8ebf1; --muted: #98a1b0; --line: #2a303b; --grid: #232933;
+      --vote: #60a5fa; --result: #4ade80; --queue: #fb923c; --votes: #a78bfa; --bad: #f87171; --warn: #fbbf24; --ok: #4ade80;
+      --shade: rgba(248, 113, 113, .14);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 16px; padding: 14px 20px; background: var(--card); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+  h1 { font-size: 17px; margin: 0; font-weight: 650; }
+  h2 { font-size: 13px; margin: 0 0 8px; font-weight: 650; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .pill { padding: 3px 11px; border-radius: 99px; font-weight: 650; font-size: 12px; border: 1px solid var(--line); text-transform: uppercase; letter-spacing: .04em; }
+  .pill.idle { color: var(--muted); }
+  .pill.baseline { color: var(--vote); border-color: var(--vote); }
+  .pill.fault { color: #fff; background: var(--bad); border-color: var(--bad); animation: pulse 1s infinite; }
+  .pill.recovery { color: var(--warn); border-color: var(--warn); }
+  .pill.killed { color: #fff; background: #111; border-color: #111; }
+  @keyframes pulse { 50% { opacity: .55; } }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
+  button { font: inherit; font-weight: 600; padding: 7px 13px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--ink); cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--muted); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.crash { background: var(--bad); border-color: var(--bad); color: #fff; }
+  button.kill { background: #111; border-color: #111; color: #fff; }
+  main { padding: 16px 20px 40px; max-width: 1400px; margin: 0 auto; }
+  #banner { display: none; margin-bottom: 12px; padding: 10px 14px; border-radius: 8px; background: var(--card); border: 1px solid var(--line); }
+  #banner.show { display: block; }
+  #banner.err { border-color: var(--bad); color: var(--bad); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .card, .panel { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .stat .v { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .stat .l { color: var(--muted); font-size: 12px; }
+  .stat .d { font-size: 12px; color: var(--muted); min-height: 16px; }
+  .stat.bad .v { color: var(--bad); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 12px; margin-bottom: 14px; }
+  canvas { width: 100%; height: 190px; display: block; }
+  table { width: 100%; border-collapse: collapse; }
+  td, th { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  .st { padding: 1px 8px; border-radius: 99px; font-size: 12px; font-weight: 600; }
+  .st.running { background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); }
+  .st.bad { background: color-mix(in srgb, var(--bad) 18%, transparent); color: var(--bad); }
+  .st.warn { background: color-mix(in srgb, var(--warn) 22%, transparent); color: var(--warn); }
+  tr.flash { animation: flash 2.5s; }
+  @keyframes flash { 0% { background: color-mix(in srgb, var(--bad) 30%, transparent); } 100% { background: transparent; } }
+  #log { max-height: 260px; overflow: auto; font: 12px/1.6 ui-monospace, Consolas, monospace; }
+  #log div b { display: inline-block; min-width: 64px; color: var(--muted); font-weight: 500; }
+  .bottom { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 12px; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  @media (max-width: 520px) { .grid { grid-template-columns: 1fr; } header { padding: 12px 14px; } main { padding: 12px 14px 32px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>chaos-ai &middot; live metrics</h1>
+  <span id="phase" class="pill idle">idle</span>
+  <span id="exp" style="color:var(--muted)"></span>
+  <div class="controls">
+    <button class="crash" data-fault='{"target":"redis","fault":"kill"}'>Crash Redis</button>
+    <button class="crash" data-fault='{"target":"db","fault":"kill"}'>Crash DB</button>
+    <button class="crash" data-fault='{"target":"worker","fault":"kill"}'>Crash Worker</button>
+    <button data-fault='{"target":"db","fault":"pause"}'>Pause DB</button>
+    <button data-fault='{"target":"vote","fault":"network-delay","params":{"latency_ms":1000}}'>Delay Vote 1s</button>
+    <button class="kill" id="abort">KILL SWITCH</button>
+    <button id="reset">Reset</button>
+  </div>
+</header>
+<main>
+  <div id="banner"></div>
+  <div class="cards" id="cards"></div>
+  <div class="grid">
+    <div class="panel"><h2>Latency p95 (ms) &middot; successful requests</h2><canvas id="c_lat"></canvas></div>
+    <div class="panel"><h2>Error rate (%) &middot; failed requests</h2><canvas id="c_err"></canvas></div>
+    <div class="panel"><h2>Throughput (requests / s)</h2><canvas id="c_n"></canvas></div>
+    <div class="panel"><h2>Redis queue length &middot; votes waiting for the worker</h2><canvas id="c_q"></canvas></div>
+    <div class="panel"><h2>Votes stored in Postgres</h2><canvas id="c_v"></canvas></div>
+    <div class="panel"><h2>Latency p50 (ms)</h2><canvas id="c_p50"></canvas></div>
+  </div>
+  <div class="bottom">
+    <div class="panel"><h2>Containers</h2><table id="ct"><thead><tr><th>service</th><th>state</th><th>health</th><th>restarts</th></tr></thead><tbody></tbody></table></div>
+    <div class="panel"><h2>Experiment</h2><div id="result" style="color:var(--muted)">No experiment yet. Press a red button to crash a service for real.</div></div>
+    <div class="panel"><h2>Container events</h2><div id="log"></div></div>
+  </div>
+  <p class="note">Everything here is read from the live SQLite store: a synthetic user posts a vote and loads the result page <span id="rate">5</span>&times; per second. The red band is the time the fault was active; red lines mark container restarts. Latency percentiles cover successful requests only; a failed request counts toward the error rate.</p>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+let data = null, prevRestarts = {}, toastTimer = null;
+
+// ---------------------------------------------------------------- charts
+function chart(canvas, o) {
+  const dpr = window.devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const g = canvas.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const L = 44, R = 10, T = 8, B = 20, pw = w - L - R, ph = h - T - B, t0 = o.t0, t1 = o.t1;
+  const X = t => L + (t - t0) / (t1 - t0) * pw;
+  const vals = o.series.flatMap(s => s.points.map(p => p[1]).filter(v => v != null));
+  let ymax = Math.max(o.minMax || 1, ...vals); ymax = niceMax(ymax * 1.1);
+  const Y = v => T + ph - (v / ymax) * ph;
+  g.font = '11px system-ui, sans-serif'; g.fillStyle = css('--muted'); g.strokeStyle = css('--grid'); g.lineWidth = 1;
+  if (o.fault && o.fault.start) {                       // the fault window
+    const a = Math.max(o.fault.start, t0), b = Math.min(o.fault.end || t1, t1);
+    if (b > a) { g.fillStyle = css('--shade'); g.fillRect(X(a), T, X(b) - X(a), ph); }
+  }
+  g.fillStyle = css('--muted'); g.textAlign = 'right'; g.textBaseline = 'middle';
+  for (let i = 0; i <= 4; i++) {
+    const v = ymax * i / 4, y = Y(v);
+    g.beginPath(); g.moveTo(L, y); g.lineTo(w - R, y); g.stroke();
+    g.fillText(fmt(v), L - 6, y);
+  }
+  g.textAlign = 'center'; g.textBaseline = 'top';
+  for (const s of [0, 30, 60, 90, 120]) { if (s <= t1 - t0) g.fillText(s === 0 ? 'now' : '-' + s + 's', X(t1 - s), h - B + 5); }
+  for (const m of (o.markers || [])) {                  // restart markers
+    if (m.t < t0) continue;
+    g.strokeStyle = css('--bad'); g.setLineDash([4, 3]); g.beginPath(); g.moveTo(X(m.t), T); g.lineTo(X(m.t), T + ph); g.stroke(); g.setLineDash([]);
+  }
+  g.lineWidth = 2; g.lineJoin = 'round';
+  for (const s of o.series) {
+    g.strokeStyle = css(s.color); g.beginPath(); let pen = false;
+    for (const [t, v] of s.points) {
+      if (v == null) { pen = false; continue; }
+      const x = X(t), y = Y(v);
+      if (!pen) { g.moveTo(x, y); pen = true; } else g.lineTo(x, y);
+    }
+    g.stroke();
+    if (s.points.length && s.points.every(p => p[1] == null) === false && o.dots) {
+      for (const [t, v] of s.points) if (v != null) { g.fillStyle = css(s.color); g.beginPath(); g.arc(X(t), Y(v), 2.2, 0, 7); g.fill(); }
+    }
+  }
+  g.textAlign = 'left'; g.textBaseline = 'top'; let lx = L + 6;
+  for (const s of o.series) { g.fillStyle = css(s.color); g.fillRect(lx, T + 4, 10, 3); g.fillStyle = css('--muted'); g.fillText(s.name, lx + 14, T); lx += 24 + g.measureText(s.name).width; }
+}
+function niceMax(v) { const p = Math.pow(10, Math.floor(Math.log10(v || 1))); for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p; return 10 * p; }
+function fmt(v) { return v >= 1000 ? (v / 1000).toFixed(v >= 10000 ? 0 : 1) + 'k' : (v >= 10 ? Math.round(v) : (Math.round(v * 10) / 10)) + ''; }
+const pts = (ts, arr) => ts.map((t, i) => [t + 0.5, arr[i]]);
+
+// ---------------------------------------------------------------- render
+function lastVal(arr, k = 4) { const a = arr.slice(-k).filter(v => v != null); return a.length ? a.reduce((x, y) => x + y, 0) / a.length : null; }
+function maxVal(arr, k) { const a = arr.slice(-k).filter(v => v != null); return a.length ? Math.max(...a) : null; }
+
+function render(d) {
+  const S = d.series, t0 = d.now - d.window_s, t1 = d.now, ex = d.experiment, ts = S.t;
+  const fault = { start: ex.fault_start, end: ex.fault_end };
+  const restarts = d.events.filter(e => e.kind === 'restart_count' && !e.initial).map(e => ({ t: e.t, service: e.service }));
+  const base = { t0, t1, fault, markers: restarts };
+
+  // phase pill + banner
+  const pill = $('#phase'); const killed = d.kill_switch && !ex.running;
+  pill.className = 'pill ' + (killed ? 'killed' : ex.phase); pill.textContent = killed ? 'kill switch engaged' : (ex.phase === 'fault' ? 'FAULT ACTIVE' : ex.phase);
+  $('#exp').textContent = ex.running ? `${ex.fault} on ${ex.target}` : '';
+  $('#rate').textContent = d.probe_rate_per_s;
+  document.querySelectorAll('button[data-fault]').forEach(b => b.disabled = ex.running || d.kill_switch);
+  $('#reset').disabled = ex.running;
+
+  // stat cards
+  const q = d.gauges.redis_queue_len, v = d.gauges.db_votes;
+  const lastQ = q.length ? q[q.length - 1][1] : null, lastV = v.length ? v[v.length - 1][1] : null;
+  const tot = Object.values(d.containers).reduce((a, c) => a + c.restarts, 0);
+  const cards = [
+    ['Vote p95', lastVal(S.vote.p95), 'ms', maxVal(S.vote.p95, 60), false],
+    ['Result p95', lastVal(S.result.p95), 'ms', maxVal(S.result.p95, 60), false],
+    ['Vote errors', lastVal(S.vote.err, 3), '%', maxVal(S.vote.err, 60), true],
+    ['Result errors', lastVal(S.result.err, 3), '%', maxVal(S.result.err, 60), true],
+    ['Redis queue', lastQ, '', q.length ? Math.max(...q.map(p => p[1] ?? 0)) : null, false],
+    ['Votes in Postgres', lastV, '', null, false],
+    ['Container restarts', tot, '', null, false],
+    ['Throughput', lastVal(S.vote.n.map((x, i) => x + S.result.n[i]), 3), 'req/s', null, false],
+  ];
+  $('#cards').innerHTML = cards.map(([l, val, u, peak, isErr]) => {
+    const bad = isErr && val != null && val > 0;
+    return `<div class="card stat ${bad ? 'bad' : ''}"><div class="l">${l}</div><div class="v">${val == null ? 'n/a' : (isErr ? val.toFixed(1) : fmt(val))}<span style="font-size:13px;color:var(--muted)"> ${val == null ? '' : u}</span></div><div class="d">${peak != null ? 'peak (60 s): ' + (isErr ? peak.toFixed(1) : fmt(peak)) + ' ' + u : ''}</div></div>`;
+  }).join('');
+
+  // charts
+  const two = (k, nm1 = 'vote', nm2 = 'result') => [{ name: nm1, color: '--vote', points: pts(ts, S.vote[k]) }, { name: nm2, color: '--result', points: pts(ts, S.result[k]) }];
+  chart($('#c_lat'), { ...base, series: two('p95'), minMax: 20 });
+  chart($('#c_err'), { ...base, series: two('err'), minMax: 10, dots: true });
+  chart($('#c_n'), { ...base, series: two('n'), minMax: 4 });
+  chart($('#c_p50'), { ...base, series: two('p50'), minMax: 10 });
+  chart($('#c_q'), { ...base, series: [{ name: 'redis_queue_len', color: '--queue', points: q }], minMax: 5, dots: true });
+  chart($('#c_v'), { ...base, series: [{ name: 'db_votes (blank = could not be read)', color: '--votes', points: v }], minMax: 10, dots: true });
+
+  // containers
+  const rows = Object.entries(d.containers).sort().map(([name, c]) => {
+    const bad = c.state !== 'running' || (c.health && c.health !== 'healthy');
+    const cls = c.state !== 'running' ? 'bad' : (c.health === 'healthy' || !c.health ? 'running' : 'warn');
+    const flash = prevRestarts[name] !== undefined && c.restarts > prevRestarts[name] ? 'flash' : '';
+    prevRestarts[name] = c.restarts;
+    return `<tr class="${flash}"><td>${name}</td><td><span class="st ${cls}">${c.state}</span></td><td>${c.health ?? '-'}</td><td>${c.restarts}</td></tr>`;
+  });
+  $('#ct tbody').innerHTML = rows.join('');
+
+  // events
+  const hh = t => new Date(t * 1000).toLocaleTimeString([], { hour12: false });
+  $('#log').innerHTML = d.events.slice(-40).reverse().map(e => {
+    if (e.initial) return `<div style="opacity:.5"><b>${hh(e.t)}</b>${e.service} ${e.kind.replace('_', ' ')} = ${e.value} (watcher snapshot)</div>`;
+    const col = (e.kind === 'restart_count' || e.value === 'exited' || e.value === 'unhealthy' || e.value === 'paused') ? 'var(--bad)' : (e.value === 'starting' ? 'var(--warn)' : 'var(--ink)');
+    return `<div><b>${hh(e.t)}</b><span style="color:${col}">${e.service} ${e.kind.replace('_', ' ')} &rarr; ${e.value}</span></div>`;
+  }).join('') || '<span style="color:var(--muted)">no changes in the last ' + d.window_s + ' s</span>';
+
+  // experiment panel
+  const r = ex.result, el = $('#result');
+  if (ex.running) {
+    const phases = { baseline: 'measuring steady state', fault: 'fault is active', recovery: 'fault lifted; measuring recovery' };
+    el.innerHTML = `<b>${ex.fault}</b> on <b>${ex.target}</b>: ${phases[ex.phase] || ex.phase}`;
+  } else if (ex.error) {
+    el.innerHTML = `<span style="color:var(--bad)">refused / failed: ${ex.error}</span>`;
+  } else if (r) {
+    const j = k => Object.entries(r[k]).map(([n, s]) => `${n}: ${s.error_rate == null ? 'n/a' : (s.error_rate * 100).toFixed(0) + '% err'}, p95 ${s.p95_ms == null ? 'n/a' : Math.round(s.p95_ms) + ' ms'}`).join(' &middot; ');
+    el.innerHTML = `<div><b>${ex.fault}</b> on <b>${ex.target}</b> &mdash; ${r.aborted ? '<span style="color:var(--bad)">auto-aborted: ' + r.abort_reason + '</span>' : 'ran to completion'}</div>
+      <div>baseline &nbsp;${j('baseline')}</div><div>during fault &nbsp;${j('during')}</div>
+      <div>recovery: ${r.recovered ? r.recovery_s + ' s (by probe metrics)' : 'not confirmed'} &middot; restarts: ${Object.entries(r.restarts).map(([k, n]) => k + ' x' + n).join(', ') || 'none'}</div>
+      ${r.rollback_errors.length ? '<div style="color:var(--bad)">ROLLBACK PROBLEMS: ' + r.rollback_errors.join('; ') + '</div>' : '<div>rollback clean</div>'}
+      ${r.missing_signals.length ? '<div style="color:var(--warn)">missing signals: ' + r.missing_signals.join('; ') + '</div>' : ''}`;
+  }
+}
+
+// ---------------------------------------------------------------- plumbing
+function banner(msg, err) { const b = $('#banner'); b.textContent = msg; b.className = 'show' + (err ? ' err' : ''); clearTimeout(toastTimer); toastTimer = setTimeout(() => b.className = '', 6000); }
+async function post(path, body) {
+  try {
+    const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Chaos': '1' }, body: JSON.stringify(body || {}) });
+    const j = await r.json(); banner(j.message || j.error, !r.ok); tick();
+  } catch (e) { banner('request failed: ' + e, true); }
+}
+document.querySelectorAll('button[data-fault]').forEach(b => b.onclick = () => post('/api/inject', JSON.parse(b.dataset.fault)));
+$('#abort').onclick = () => post('/api/abort');
+$('#reset').onclick = () => post('/api/reset');
+async function tick() {
+  try { const r = await fetch('/api/metrics'); data = await r.json(); render(data); }
+  catch (e) { banner('dashboard server not reachable', true); }
+}
+setInterval(tick, 1000); tick();
+window.addEventListener('resize', () => data && render(data));
+</script>
+</body>
+</html>

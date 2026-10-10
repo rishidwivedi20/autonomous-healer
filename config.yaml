@@ -45,6 +45,13 @@ planner:
   llm_effort: medium         # low | medium | high | xhigh | max
   llm_pool: 14               # how many top candidates the LLM may choose from
 
+dashboard:                   # `chaos dashboard`: live web page with an inject button
+  port: 8765
+  probe_rate_per_s: 5        # probe requests per second per journey (the CLI uses 1/s; faster shows short outages)
+  window_s: 120              # seconds of history on the charts
+  baseline_s: 8              # steady-state window before a button-launched fault
+  duration_s: 20             # how long button-launched faults run
+
 agent:                       # the injector agent (`chaos agent`)
   max_experiments: 6
   cooldown_s: 10             # pause between experiments

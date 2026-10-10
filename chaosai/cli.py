@@ -17,13 +17,14 @@ import typer
 import yaml
 
 from . import config as config_mod
+from . import dashboard as dashboard_mod
 from . import discovery, planner
 from .agent import InjectorAgent
 from .injector import InjectionError
 from .models import Experiment, Graph, Thresholds
 from .observer import DockerWatcher, LoadProbe, ProbeConfig, Store, unhealthy
 from .orchestrator import Orchestrator, measure_baseline
-from .safety import Guard, KillSwitch, SafetyViolation, is_managed
+from .safety import ExperimentLock, Guard, KillSwitch, SafetyViolation, is_managed
 
 app = typer.Typer(help="Safe chaos experiments against the voting app.", no_args_is_help=True)
 
@@ -94,19 +95,24 @@ def offline_orchestrator(c: config_mod.Config) -> tuple[Orchestrator, Guard]:
                         **orchestrator_kwargs(c)), guard
 
 
-def start_live(c: config_mod.Config, kill: KillSwitch, vote_url=None, result_url=None) -> SimpleNamespace:
+def start_live(c: config_mod.Config, kill: KillSwitch, vote_url=None, result_url=None, interval_s=None,
+               gauge_every_s=2.0, install_signals=True) -> SimpleNamespace:
     """Connect to Docker, start the probe and watcher, install signal handlers. Exits cleanly without Docker."""
     try:
         injector = make_injector()
-        guard = Guard(set(injector.list_targets()), kill, c.safety.max_duration_s)
+        guard = Guard(set(injector.list_targets()), kill, c.safety.max_duration_s,
+                      lock=ExperimentLock(RESULTS / "experiment.lock"))
     except Exception as e:
         fail(f"cannot reach Docker: {e}")
     store = Store(RESULTS / "chaosai.db")
     pc = probe_config(c, vote_url, result_url)
+    if interval_s:
+        pc.interval_s = interval_s
     probe = LoadProbe(store, pc)
     injector.probe = probe                       # traffic-spike needs the live probe
-    watcher = DockerWatcher(store, client=injector.client)
-    kill.install_signal_handlers()
+    watcher = DockerWatcher(store, client=injector.client, gauge_every_s=gauge_every_s)
+    if install_signals:
+        kill.install_signal_handlers()
     probe.start()
     watcher.start()
     health = lambda: unhealthy(watcher.snapshot())
@@ -244,6 +250,53 @@ def agent(top: int = typer.Option(None, "--top", "-n", help="experiments to plan
     typer.echo(f"saved {out}")
     if run.status == "stopped":
         raise typer.Exit(1)
+
+
+# ------------------------------------------------------------------ dashboard
+@app.command()
+def dashboard(port: int = typer.Option(None, help="default: dashboard.port"),
+              rate: float = typer.Option(None, help="probe requests per second per journey (default: dashboard.probe_rate_per_s)"),
+              open_browser: bool = typer.Option(False, "--open", help="open the page in your browser")):
+    """Live web dashboard: watch every metric move while you inject real faults with the buttons."""
+    c = cfg()
+    port = port or c.dashboard.port
+    c.dashboard.probe_rate_per_s = rate or c.dashboard.probe_rate_per_s
+    kill = kill_switch()
+    live = start_live(c, kill, interval_s=1.0 / c.dashboard.probe_rate_per_s, gauge_every_s=1.0, install_signals=False)
+    table = dashboard_mod.ContainerTable(live.watcher.table)
+    table.start()
+    web = dashboard_mod.App(c, live.store, live.injector, kill, live.orch, lambda: table.data)
+    try:
+        server = dashboard_mod.make_server(web, port)
+    except OSError as e:
+        live.stop()
+        table.stop()
+        fail(f"cannot listen on 127.0.0.1:{port}: {e}")
+    url = f"http://127.0.0.1:{port}/"
+    typer.echo(f"dashboard: {url}   (probe {c.dashboard.probe_rate_per_s:g} req/s per journey; Ctrl+C to stop)")
+    if open_browser:
+        import webbrowser
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        engaged_here = False
+        if web.runner.snapshot()["running"]:                       # never leave a fault behind on exit
+            typer.echo("stopping the running experiment ...")
+            kill.engage("dashboard shutdown")
+            engaged_here = True
+            if web.runner.thread:
+                web.runner.thread.join(timeout=30)
+        errors = live.injector.restore_all()
+        if errors:
+            typer.secho(f"restore problems on exit: {errors}", fg=typer.colors.RED, err=True)
+        elif engaged_here:
+            kill.reset()
+        server.server_close()
+        table.stop()
+        live.stop()
 
 
 # ------------------------------------------------------------------ baseline

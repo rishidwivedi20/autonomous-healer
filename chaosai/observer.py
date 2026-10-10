@@ -295,6 +295,19 @@ class DockerWatcher:
                 state.get("Status", "unknown"), (state.get("Health") or {}).get("Status"))
         return snap
 
+    def table(self) -> dict[str, dict]:
+        """service -> {state, health, restarts} for the dashboard's container table."""
+        out = {}
+        for c in self.client.containers.list(all=True, filters={"label": self.label}):
+            c.reload()
+            st = c.attrs.get("State", {})
+            out[c.labels.get("com.docker.compose.service", c.name)] = {
+                "state": st.get("Status", "unknown"),
+                "health": (st.get("Health") or {}).get("Status"),
+                "restarts": int(c.attrs.get("RestartCount", 0)),
+            }
+        return out
+
     def poll_once(self) -> None:
         now = time.time()
         for c in self.client.containers.list(all=True, filters={"label": self.label}):

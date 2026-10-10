@@ -2,7 +2,7 @@
 
 Inject failures into a small microservices app (Docker's example-voting-app), observe the real impact, then (Day 2) have an AI agent diagnose what broke from stored evidence and recommend cited fixes. See [PLAN.md](PLAN.md).
 
-**Status: Day 1 complete and verified on real Docker Desktop (190 unit tests; baseline, redis crash, auto-abort, mid-run kill switch and the injector agent all exercised live).**
+**Status: Day 1 complete and verified on real Docker Desktop (221 unit tests; baseline, redis crash, auto-abort, mid-run kill switch and the injector agent all exercised live).**
 
 ## Reproduce from scratch (Windows, PowerShell)
 
@@ -27,6 +27,7 @@ python -m venv .venv; .\.venv\Scripts\pip install -r requirements.txt
 
 | Command | What it does |
 |---|---|
+| `chaos dashboard [--port N] [--rate R] [--open]` | **Live web page** at http://127.0.0.1:8765: charts for both user journeys, the redis queue and Postgres vote count, container table with restarts, event log, and buttons that inject real faults (plus KILL SWITCH / Reset) |
 | `chaos config` | Prints the effective parameters (`config.yaml` merged over the defaults) |
 | `chaos plan [--top N] [--offline] [--dry-run]` | Ranks which experiments to run first (heuristic risk score, re-ranked by Claude when `ANTHROPIC_API_KEY` is set) |
 | `chaos agent [--top N] [--max N] [--offline] [--dry-run] [-y]` | **The injector agent**: plans, then introduces the faults one at a time through the safety guard |
@@ -38,6 +39,12 @@ python -m venv .venv; .\.venv\Scripts\pip install -r requirements.txt
 | `chaos status` | Kill switch, recorded active faults, container state |
 
 Faults: `kill`, `stop`, `pause`, `cpu-limit`, `memory-limit`, `network-delay`, `network-loss`, `traffic-spike`. Parameters via `-p key=value` (e.g. `-p latency_ms=800`, `-p cpus=0.25`, `-p mem=32m`, `-p loss_pct=40`, `-p multiplier=8`).
+
+## Live dashboard
+
+`.\chaos.cmd dashboard` serves http://127.0.0.1:8765 (loopback only). It starts the load probe at `dashboard.probe_rate_per_s` (default 5 requests/s per journey; the CLI's 1/s is too coarse to see a sub-second redis crash) and reads the pipeline gauges every second. Press **Crash Redis** (or DB / Worker / Pause DB / Delay Vote) and watch: the red band is the time the fault was active, red dashed lines are real container restarts, and the cards, charts, container table and event log all update once a second. **KILL SWITCH** aborts the running experiment and undoes every fault; **Reset** clears it. Everything shown is read from the same SQLite store the CLI writes; nothing is synthesised.
+
+Safety of the page itself: bound to 127.0.0.1; every request must carry a loopback `Host`; POSTs need `X-Chaos: 1` plus JSON (which forces a CORS preflight no other site can pass) and a same-origin `Origin`; faults go through the same guard, abort rules and rollback as `chaos run`. An OS file lock (`results/experiment.lock`) enforces one experiment at a time across *processes* (two dashboards, or a dashboard plus `chaos run`); it is released automatically if the holder dies. A second dashboard on the same port is refused.
 
 ## Parameters
 

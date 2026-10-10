@@ -5,6 +5,7 @@ it to the injector and wraps every injection in try/finally.
 """
 from __future__ import annotations
 
+import os
 import signal
 import threading
 from pathlib import Path
@@ -22,6 +23,69 @@ class SafetyViolation(Exception):
 
 def is_managed(labels: dict | None) -> bool:
     return (labels or {}).get(LABEL) == "true"
+
+
+_LOCK_OFFSET = 1_000_000
+
+
+class ExperimentLock:
+    """Cross-process 'one experiment at a time'.
+
+    Guard._running only knows about its own process; two dashboards, or a dashboard plus `chaos run`,
+    could otherwise inject at once. This is an OS file lock (msvcrt on Windows, flock elsewhere): it is
+    released automatically if the holder crashes, so it can never go stale, and a pid is written into
+    the file only to make the refusal message useful."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._fh = None
+
+    def acquire(self) -> bool:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(self.path, "a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+                fh.seek(_LOCK_OFFSET)       # lock a byte far past the pid text: Windows locks block reads of the range
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False
+        self._fh = fh
+        try:                                    # informational only; the OS lock is what protects
+            fh.seek(0)
+            fh.truncate()
+            fh.write(f"pid {os.getpid()}\n".encode())
+            fh.flush()
+        except OSError:
+            pass
+        return True
+
+    def holder(self) -> str:
+        try:
+            return self.path.read_text(encoding="utf-8", errors="replace").strip() or "unknown"
+        except OSError:
+            return "unknown"
+
+    def release(self) -> None:
+        fh, self._fh = self._fh, None
+        if fh is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                fh.seek(_LOCK_OFFSET)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            fh.close()
 
 
 class KillSwitch:
@@ -53,7 +117,9 @@ class KillSwitch:
 
 
 class Guard:
-    def __init__(self, managed_targets: set[str], kill: KillSwitch, max_duration_s: int = MAX_DURATION_S):
+    def __init__(self, managed_targets: set[str], kill: KillSwitch, max_duration_s: int = MAX_DURATION_S,
+                 lock: ExperimentLock | None = None):
+        self.lock = lock
         self.max_duration_s = max(1, min(max_duration_s, MAX_DURATION_S))   # config may only tighten the hard cap
         self.managed_targets = managed_targets   # service names whose container has the label
         self.kill = kill
@@ -94,12 +160,16 @@ class Guard:
         """One experiment at a time."""
         if self._running:
             raise SafetyViolation("another experiment is already running")
+        if self.lock is not None and not self.lock.acquire():
+            raise SafetyViolation(f"another experiment is already running in another process ({self.lock.holder()})")
         self._running = True
         self._breaches = 0
         self.abort_reason = None
 
     def end(self) -> None:
         self._running = False
+        if self.lock is not None:
+            self.lock.release()
 
     # ------------------------------------------------------------ during
     def should_abort(self, stats: Stats, t: Thresholds) -> bool:

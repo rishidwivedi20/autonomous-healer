@@ -99,6 +99,14 @@ class AgentCfg(_Base):
     max_consecutive_skips: int = Field(2, ge=1)    # stop if this many experiments in a row are refused
 
 
+class DashboardCfg(_Base):
+    port: int = Field(8765, ge=1, le=65535)
+    probe_rate_per_s: float = Field(5.0, gt=0, le=50)   # requests per second per journey (faster than the CLI's 1/s so short outages show)
+    window_s: int = Field(120, ge=30, le=900)           # seconds of history shown
+    baseline_s: int = Field(8, ge=1)                    # steady-state window before a button-launched fault
+    duration_s: int = Field(20, ge=5)                   # how long button-launched faults run (hard cap still applies)
+
+
 class Config(_Base):
     app: AppCfg = Field(default_factory=AppCfg)
     probe: ProbeCfg = Field(default_factory=ProbeCfg)
@@ -107,6 +115,7 @@ class Config(_Base):
     faults: dict[str, FaultCfg] = Field(default_factory=dict)
     planner: PlannerCfg = Field(default_factory=PlannerCfg)
     agent: AgentCfg = Field(default_factory=AgentCfg)
+    dashboard: DashboardCfg = Field(default_factory=DashboardCfg)
 
     @field_validator("faults")
     @classmethod
