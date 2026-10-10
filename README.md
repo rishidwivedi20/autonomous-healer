@@ -11,17 +11,17 @@ Prerequisite: Docker Desktop running (WSL2 backend), Python 3.11+.
 ```powershell
 git clone https://github.com/rishidwivedi20/autonomous-healer.git chaos-ai; cd chaos-ai
 python -m venv .venv; .\.venv\Scripts\pip install -r requirements.txt
-.\.venv\Scripts\python -m pytest -q                 # 103 tests, no Docker needed
+.\.venv\Scripts\python -m pytest -q                 # 190 tests, no Docker needed
 .\deploy\tasks.ps1 up                               # vote :8080, result :8081, waits until healthy
-.\chaos discover                                    # dependency map -> results\graph.json (+ Mermaid)
-.\chaos baseline --seconds 120                      # steady-state p50/p95/error rate -> results\baseline.json
-.\chaos run redis kill --dry-run                    # validate and print the plan, inject nothing
-.\chaos run redis kill --hypothesis "votes fail until redis restarts"
-.\chaos run vote network-delay -p latency_ms=3000   # should trip the auto-abort
+.\chaos.cmd discover                                    # dependency map -> results\graph.json (+ Mermaid)
+.\chaos.cmd baseline --seconds 120                      # steady-state p50/p95/error rate -> results\baseline.json
+.\chaos.cmd run redis kill --dry-run                    # validate and print the plan, inject nothing
+.\chaos.cmd run redis kill --hypothesis "votes fail until redis restarts"
+.\chaos.cmd run vote network-delay -p latency_ms=3000   # should trip the auto-abort
 .\deploy\tasks.ps1 down
 ```
 
-(`chaos` is `chaos.cmd`, a wrapper for `python -m chaosai`. On git-bash use `./chaos`.)
+(`chaos.cmd` is a wrapper for `python -m chaosai`. In PowerShell type the full `.\chaos.cmd`; plain `.\chaos` is not found. In git-bash use `./chaos`.)
 
 ## Commands
 
