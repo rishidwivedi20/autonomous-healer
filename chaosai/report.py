@@ -7,11 +7,13 @@ the report says which. Every number in an evidence line was already validated ag
 from __future__ import annotations
 
 import html
+import json
+import threading
 import time
 from pathlib import Path
 from typing import Optional
 
-from .analysis import Analysis
+from .analysis import Analysis, Recorder
 from .models import ExperimentResult, Graph
 from .scoring import OverallScore, WEIGHTS, overall, score_experiment
 
@@ -222,8 +224,42 @@ def to_html(rep: dict) -> str:
     return "".join(h)
 
 
+class Live:
+    """The report as the dashboard shows it: rebuilt from the stored results only when they change, with the
+    deterministic rule-based analysis (a page refresh must never spend API credits). Thread-safe."""
+
+    SKIP = {"graph.json", "baseline.json", "plan.json", "analysis.json", "findings.json"}
+
+    def __init__(self, results_dir: Path | str, store=None, graph_fn=None):
+        self.dir, self.store, self.graph_fn = Path(results_dir), store, graph_fn
+        self._lock = threading.Lock()
+        self._sig = None
+        self._rep: dict = {"empty": True}
+        self.builds = 0
+
+    def _signature(self) -> tuple:
+        return tuple((p.name, p.stat().st_mtime_ns) for p in sorted(self.dir.glob("*.json")) if p.name not in self.SKIP)
+
+    def _build(self) -> dict:
+        from .evidence import Evidence
+        from .rules import analyse
+        ev = Evidence(self.dir, store=self.store)
+        ids = ev.ids()
+        if not ids:
+            return {"empty": True}
+        graph = Graph.model_validate(self.graph_fn()) if self.graph_fn else None
+        return build(ev, analyse(Recorder(ev), ids), graph, ids)
+
+    def get(self) -> dict:
+        with self._lock:
+            sig = self._signature()
+            if sig != self._sig:
+                self._rep, self._sig = self._build(), sig
+                self.builds += 1
+            return self._rep
+
+
 def write(out_dir: Path | str, rep: dict) -> dict[str, Path]:
-    import json
     d = Path(out_dir)
     paths = {"json": d / "findings.json", "md": d / "findings.md", "html": d / "findings.html"}
     paths["json"].write_text(json.dumps(rep, indent=2), encoding="utf-8")

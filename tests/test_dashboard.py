@@ -93,12 +93,12 @@ def wait_for(cond, secs=3):
     return False
 
 
-def make_app(tmp_path, orch=None, graph_fn=None):
+def make_app(tmp_path, orch=None, graph_fn=None, report_fn=None):
     cfg = config.load(Path("none.yaml"))
     kill = KillSwitch(tmp_path / "KILL")
     orch = orch or FakeOrch()
     app = App(cfg, Store(tmp_path / "t.db"), orch.injector, kill, orch,
-              lambda: {"redis": {"state": "running", "health": "healthy", "restarts": 0}}, graph_fn=graph_fn)
+              lambda: {"redis": {"state": "running", "health": "healthy", "restarts": 0}}, graph_fn=graph_fn, report_fn=report_fn)
     return app, orch, kill
 
 
@@ -278,8 +278,8 @@ GRAPH = {"critical_path": ["vote", "redis"], "services": {
     "redis": {"name": "redis", "replicas": 1, "healthcheck": True, "depends_on": [], "on_critical_path": True}}}
 
 
-def serve(tmp_path, graph_fn):
-    app, orch, kill = make_app(tmp_path, graph_fn=graph_fn)
+def serve(tmp_path, graph_fn=None, report_fn=None):
+    app, orch, kill = make_app(tmp_path, graph_fn=graph_fn, report_fn=report_fn)
     server = make_server(app, 0)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, orch

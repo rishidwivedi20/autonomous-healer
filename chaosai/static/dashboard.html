@@ -86,6 +86,29 @@
   .badge.b-dim rect { stroke: var(--muted); } .badge.b-dim text { fill: var(--muted); }
   .legend { color: var(--muted); font-size: 12px; margin-top: 4px; }
   .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin: 0 4px 0 12px; vertical-align: -1px; }
+  /* results: score, history, findings */
+  .rp .ok { color: var(--ok); } .rp .warn { color: var(--warn); } .rp .bad { color: var(--bad); } .rp .mut { color: var(--muted); }
+  .scorebox { display: flex; gap: 22px; align-items: center; flex-wrap: wrap; }
+  .rp .big { font-size: 54px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+  .pillband { display: inline-block; margin-top: 6px; padding: 1px 11px; border-radius: 99px; font-size: 12px; font-weight: 700; text-transform: uppercase; border: 1px solid currentColor; }
+  .bars { flex: 1; min-width: 240px; }
+  .bar { display: grid; grid-template-columns: 130px 1fr 34px; gap: 8px; align-items: center; margin: 5px 0; }
+  .bl i { color: var(--muted); font-style: normal; font-size: 11px; }
+  .bt { height: 8px; background: var(--grid); border-radius: 99px; overflow: hidden; }
+  .bf { display: block; height: 100%; border-radius: 99px; background: currentColor; }
+  .bv { text-align: right; font-variant-numeric: tabular-nums; }
+  table.hist code, .find code { font-size: 11px; color: var(--muted); }
+  .hrow { cursor: pointer; } .hrow:hover { background: var(--grid); }
+  .hdetail ul { margin: 4px 0; padding-left: 18px; }
+  .hist-wrap { max-height: 360px; overflow: auto; }
+  .find { border-top: 1px solid var(--grid); padding: 10px 0; }
+  .sev { padding: 1px 8px; border-radius: 99px; font-size: 11px; font-weight: 700; border: 1px solid currentColor; }
+  .rp .sev.critical, .rp .sev.high { color: var(--bad); } .rp .sev.medium { color: var(--warn); } .rp .sev.low { color: var(--ok); }
+  .ev { margin: 6px 0 0; padding-left: 18px; }
+  .rp pre { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; overflow: auto; font-size: 12px; margin: 6px 0; }
+  .rp h3 { font-size: 13px; margin: 14px 0 0; }
+  a.btn { display: inline-block; font-weight: 600; padding: 6px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--ink); text-decoration: none; margin-right: 6px; }
+  a.btn:hover { border-color: var(--muted); }
   @media (max-width: 520px) { .grid { grid-template-columns: 1fr; } header { padding: 12px 14px; } main { padding: 12px 14px 32px; } }
 </style>
 </head>
@@ -129,9 +152,20 @@
     <div class="panel"><h2>Experiment</h2><div id="result" style="color:var(--muted)">No experiment yet. Press a red button to crash a service for real.</div></div>
     <div class="panel"><h2>Container events</h2><div id="log"></div></div>
   </div>
+  <div class="panel rp" style="margin-top:14px">
+    <h2>Resilience score &middot; every stored experiment</h2>
+    <div id="r_score" class="mut">loading&hellip;</div>
+    <div style="margin-top:10px">
+      <a class="btn" href="/report.html" download>Download report (HTML)</a><a class="btn" href="/report.md" download>Markdown</a><a class="btn" href="/report.json" download>JSON</a>
+    </div>
+  </div>
+  <div class="panel rp" style="margin-top:12px"><h2>Experiment history &middot; click a row for its score breakdown</h2><div id="r_hist" class="hist-wrap"></div></div>
+  <div class="panel rp" style="margin-top:12px"><h2>Findings &middot; ranked, with the evidence behind each</h2><div id="r_find"></div>
+    <div class="note">Rule-based analysis of the stored results, refreshed when an experiment finishes. Run <code>chaos report</code> (without <code>--offline</code>) for the Claude-written version.</div></div>
   <p class="note">Everything here is read from the live SQLite store: a synthetic user posts a vote and loads the result page <span id="rate">5</span>&times; per second. The red band is the time the fault was active; red lines mark container restarts. Latency percentiles cover successful requests only; a failed request counts toward the error rate.</p>
 </main>
 <script src="/graph.js"></script>
+<script src="/report.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
@@ -147,6 +181,31 @@ function drawGraph(d) {
     errors: { vote: recentErrors(d.series.vote.err), result: recentErrors(d.series.result.err) } });
 }
 loadGraph();
+
+// ---------------------------------------------------------------- results panels
+let REPORT = null, wasRunning = false;
+const openRows = new Set();
+function drawReport() {
+  if (!window.ChaosReport) return;
+  $('#r_score').innerHTML = ChaosReport.scoreHtml(REPORT);
+  $('#r_hist').innerHTML = ChaosReport.historyHtml(REPORT);
+  $('#r_find').innerHTML = ChaosReport.findingsHtml(REPORT);
+  document.querySelectorAll('#r_hist .hdetail').forEach(r => { r.hidden = !openRows.has(r.dataset.id); });
+}
+async function loadReport() {
+  try {
+    const r = await fetch('/api/report'); const rep = await r.json();
+    if (!r.ok) throw new Error(rep.error || r.status);
+    REPORT = rep; drawReport(); if (data) render(data);
+  } catch (e) { $('#r_score').innerHTML = '<span class="bad">report unavailable: ' + ChaosReport.esc(e.message || e) + '</span>'; }
+}
+function toggleRow(row) {
+  const id = row.dataset.id, d = [...document.querySelectorAll('#r_hist .hdetail')].find(x => x.dataset.id === id);
+  if (!d) return; d.hidden = !d.hidden; d.hidden ? openRows.delete(id) : openRows.add(id);
+}
+$('#r_hist').addEventListener('click', e => { const row = e.target.closest('.hrow'); if (row) toggleRow(row); });
+$('#r_hist').addEventListener('keydown', e => { const row = e.target.closest('.hrow'); if (row && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); toggleRow(row); } });
+loadReport(); setInterval(loadReport, 30000);
 
 // ---------------------------------------------------------------- charts
 function chart(canvas, o) {
@@ -228,7 +287,9 @@ function render(d) {
     ['Container restarts', tot, '', null, false],
     ['Throughput', lastVal(S.vote.n.map((x, i) => x + S.result.n[i]), 3), 'req/s', null, false],
   ];
-  $('#cards').innerHTML = cards.map(([l, val, u, peak, isErr]) => {
+  const rc = window.ChaosReport && ChaosReport.cardHtml(REPORT);
+  const scoreCard = rc ? `<div class="card stat"><div class="l">${rc.label}</div><div class="v" style="color:var(--${rc.tone === 'mut' ? 'muted' : rc.tone})">${rc.value}<span style="font-size:13px;color:var(--muted)"> ${rc.unit}</span></div><div class="d">${ChaosReport.esc(rc.detail)} &middot; all stored experiments</div></div>` : '';
+  $('#cards').innerHTML = scoreCard + cards.map(([l, val, u, peak, isErr]) => {
     const bad = isErr && val != null && val > 0;
     return `<div class="card stat ${bad ? 'bad' : ''}"><div class="l">${l}</div><div class="v">${val == null ? 'n/a' : (isErr ? val.toFixed(1) : fmt(val))}<span style="font-size:13px;color:var(--muted)"> ${val == null ? '' : u}</span></div><div class="d">${peak != null ? 'peak (60 s): ' + (isErr ? peak.toFixed(1) : fmt(peak)) + ' ' + u : ''}</div></div>`;
   }).join('');
@@ -289,7 +350,11 @@ document.querySelectorAll('button[data-fault]').forEach(b => b.onclick = () => p
 $('#abort').onclick = () => post('/api/abort');
 $('#reset').onclick = () => post('/api/reset');
 async function tick() {
-  try { const r = await fetch('/api/metrics'); data = await r.json(); render(data); }
+  try {
+    const r = await fetch('/api/metrics'); data = await r.json(); render(data);
+    if (wasRunning && !data.experiment.running) loadReport();          // a result was just written: refresh score, history, findings
+    wasRunning = !!data.experiment.running;
+  }
   catch (e) { banner('dashboard server not reachable', true); }
 }
 setInterval(tick, 1000); tick();

@@ -312,7 +312,9 @@ def dashboard(port: int = typer.Option(None, help="default: dashboard.port"),
     graph_obj, graph_notes = discovery.discover(COMPOSE, COMPOSE.parent / "graph.overrides.yaml")
     discovery.write_graph(graph_obj, RESULTS / "graph.json", graph_notes)     # keep results/graph.json in step with what is drawn
     graph_dump = graph_obj.model_dump()
-    web = dashboard_mod.App(c, live.store, live.injector, kill, live.orch, lambda: table.data, graph_fn=lambda: graph_dump)
+    findings = report_mod.Live(RESULTS, live.store, lambda: graph_dump)
+    web = dashboard_mod.App(c, live.store, live.injector, kill, live.orch, lambda: table.data, graph_fn=lambda: graph_dump,
+                            report_fn=findings.get)
     try:
         server = dashboard_mod.make_server(web, port)
     except OSError as e:

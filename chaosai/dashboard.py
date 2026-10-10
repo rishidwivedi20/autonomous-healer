@@ -1,6 +1,8 @@
 """Live dashboard: a local web page that shows every metric moving while a real fault is injected.
 
   GET  /                 the page (chaosai/static/dashboard.html)
+  GET  /api/report       the findings report as JSON (score, history, ranked weaknesses, fixes)
+  GET  /report.html|.md|.json   the same report as a download
   GET  /api/metrics      one JSON snapshot: per-second series for both journeys, pipeline gauges,
                          container table, container events, experiment state, kill switch
   POST /api/inject       {target, fault, params?, duration_s?}  start one experiment in the background
@@ -32,6 +34,7 @@ from .safety import SafetyViolation
 
 STATIC = Path(__file__).parent / "static" / "dashboard.html"
 GRAPH_JS = Path(__file__).parent / "static" / "graph.js"
+REPORT_JS = Path(__file__).parent / "static" / "report.js"
 JOURNEYS = ("vote", "result")
 GAUGES = ("redis_queue_len", "db_votes")
 
@@ -164,11 +167,34 @@ class ContainerTable(threading.Thread):
 
 
 class App:
-    def __init__(self, cfg: Config, store: Store, injector, kill, orch, containers_fn, graph_fn=None):
+    def __init__(self, cfg: Config, store: Store, injector, kill, orch, containers_fn, graph_fn=None, report_fn=None):
         self.cfg, self.store, self.injector, self.kill = cfg, store, injector, kill
         self.runner = Runner(orch, cfg)
         self.containers_fn = containers_fn
         self.graph_fn = graph_fn
+        self.report_fn = report_fn
+
+    def report(self) -> tuple[int, dict]:
+        """The findings report (rule-based analysis of the stored experiments) for the score/history/findings panels."""
+        if self.report_fn is None:
+            return 503, {"error": "the findings report is not available"}
+        try:
+            return 200, self.report_fn()
+        except Exception as e:
+            return 503, {"error": f"could not build the report: {type(e).__name__}: {e}"}
+
+    def report_download(self, kind: str) -> tuple[int, bytes, str, str]:
+        """(status, body, content type, file name) for /report.html|md|json."""
+        from . import report as report_mod
+        code, rep = self.report()
+        if code != 200 or rep.get("empty"):
+            msg = rep.get("error", "no experiments yet: run one first")
+            return (code if code != 200 else 404), msg.encode(), "text/plain; charset=utf-8", ""
+        if kind == "html":
+            return 200, report_mod.to_html(rep).encode(), "text/html; charset=utf-8", "chaosai-findings.html"
+        if kind == "md":
+            return 200, report_mod.to_markdown(rep).encode(), "text/markdown; charset=utf-8", "chaosai-findings.md"
+        return 200, json.dumps(rep, indent=2).encode(), "application/json", "chaosai-findings.json"
 
     def graph(self) -> tuple[int, dict]:
         """The dependency map (same data as results/graph.json) for the graph panel."""
@@ -251,9 +277,11 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):                                 # keep the terminal quiet
         pass
 
-    def _send(self, code: int, body: bytes, ctype: str) -> None:
+    def _send(self, code: int, body: bytes, ctype: str, filename: str = "") -> None:
         self.send_response(code)
         self.send_header("Content-Type", ctype)
+        if filename:
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -281,6 +309,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, STATIC.read_bytes(), "text/html; charset=utf-8")
         if path == "/graph.js":
             return self._send(200, GRAPH_JS.read_bytes(), "application/javascript; charset=utf-8")
+        if path == "/report.js":
+            return self._send(200, REPORT_JS.read_bytes(), "application/javascript; charset=utf-8")
+        if path in ("/report.html", "/report.md", "/report.json"):
+            code, body, ctype, name = self.server.app.report_download(path.rsplit(".", 1)[1])
+            return self._send(code, body, ctype, name)
+        if path == "/api/report":
+            return self._json(*self.server.app.report())
         if path == "/api/metrics":
             return self._json(200, self.server.app.metrics())
         if path == "/api/graph":
