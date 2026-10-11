@@ -109,6 +109,28 @@
   .rp h3 { font-size: 13px; margin: 14px 0 0; }
   a.btn { display: inline-block; font-weight: 600; padding: 6px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--ink); text-decoration: none; margin-right: 6px; }
   a.btn:hover { border-color: var(--muted); }
+  /* autonomous injecting agent */
+  .agent { border-width: 2px; }
+  .agent-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; margin-bottom: 8px; }
+  .agent-ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-left: auto; }
+  .agent-ctl label { color: var(--muted); font-size: 13px; }
+  .agent-ctl select { font: inherit; padding: 5px 6px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--ink); }
+  .pill.ok { color: var(--ok); border-color: var(--ok); }
+  .pill.bad { color: var(--bad); border-color: var(--bad); }
+  .pill.planning { color: var(--vote); border-color: var(--vote); animation: pulse 1s infinite; }
+  #agentNow { font-size: 15px; margin: 4px 0 10px; min-height: 22px; }
+  #agentNow .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--bad); margin-right: 8px; animation: pulse 1s infinite; vertical-align: -1px; }
+  #agentNow .dot.calm { background: var(--muted); animation: none; }
+  table.plan td { vertical-align: top; }
+  table.plan tr.cur { background: color-mix(in srgb, var(--bad) 9%, transparent); }
+  .plan .why { color: var(--muted); font-size: 12px; max-width: 360px; }
+  .chip { display: inline-block; padding: 1px 9px; border-radius: 99px; font-size: 12px; font-weight: 650; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+  .chip.running { color: #fff; background: var(--bad); border-color: var(--bad); animation: pulse 1s infinite; }
+  .chip.ok { color: var(--ok); border-color: var(--ok); }
+  .chip.warn { color: var(--warn); border-color: var(--warn); }
+  .chip.bad { color: var(--bad); border-color: var(--bad); }
+  #agentLog { font: 12px/1.6 ui-monospace, Consolas, monospace; margin-top: 8px; max-height: 150px; overflow: auto; color: var(--muted); }
+  #agentLog b { font-weight: 500; margin-right: 8px; }
   @media (max-width: 520px) { .grid { grid-template-columns: 1fr; } header { padding: 12px 14px; } main { padding: 12px 14px 32px; } }
 </style>
 </head>
@@ -131,6 +153,21 @@
 </header>
 <main>
   <div id="banner"></div>
+  <div class="panel agent" id="agentPanel">
+    <div class="agent-head">
+      <h2 style="margin:0">Autonomous injecting agent</h2>
+      <span id="agentPill" class="pill idle">idle</span>
+      <div class="agent-ctl">
+        <label>experiments <select id="agentMax"><option>1</option><option selected>2</option><option>3</option></select></label>
+        <label><input type="checkbox" id="agentLlm" checked> AI planner</label>
+        <button class="crash" id="agentStart">Start the agent</button>
+      </div>
+    </div>
+    <div id="agentNow" style="color:var(--muted)">Press <b>Start the agent</b>: it chooses which faults to inject, injects them one at a time and rolls each back, with nobody pressing a fault button.</div>
+    <div id="agentPlan"></div>
+    <div id="agentLog"></div>
+    <div class="note">The agent runs the same planner, safety guard (allowlist, 60 s cap, auto-abort) and rollback as <code>chaos agent</code>. The KILL SWITCH stops it at any moment.</div>
+  </div>
   <div class="cards" id="cards"></div>
   <div class="panel" style="margin-bottom:14px">
     <h2>Dependency graph &middot; live health and blast radius</h2>
@@ -184,7 +221,7 @@ function drawGraph(d) {
 loadGraph();
 
 // ---------------------------------------------------------------- results panels
-let REPORT = null, wasRunning = false;
+let REPORT = null, wasRunning = false, wasAgent = false;
 const openRows = new Set();
 function drawReport() {
   if (!window.ChaosReport) return;
@@ -260,8 +297,55 @@ const pts = (ts, arr) => ts.map((t, i) => [t + 0.5, arr[i]]);
 function lastVal(arr, k = 4) { const a = arr.slice(-k).filter(v => v != null); return a.length ? a.reduce((x, y) => x + y, 0) / a.length : null; }
 function maxVal(arr, k) { const a = arr.slice(-k).filter(v => v != null); return a.length ? Math.max(...a) : null; }
 
+const aesc = s => (window.ChaosReport && ChaosReport.esc) ? ChaosReport.esc(s) : String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const PHASES = { baseline: 'measuring the steady state first', fault: 'the fault is ACTIVE right now', recovery: 'fault lifted; measuring recovery' };
+function chipFor(r) {
+  if (r.status === 'running') return ['running', 'injecting now'];
+  if (r.status === 'pending') return ['', 'waiting'];
+  if (r.status === 'skipped') return ['warn', 'refused by the safety guard'];
+  if (r.status === 'error') return ['bad', 'error'];
+  const a = r.aborted ? 'auto-aborted (' + aesc(r.abort_reason || 'threshold') + '); ' : '';
+  return r.recovered ? ['ok', a + 'recovered in ' + (r.recovery_s == null ? '?' : Math.round(r.recovery_s) + ' s')] : ['bad', a + 'recovery not confirmed'];
+}
+function renderAgent(d) {
+  const a = d.agent, panel = $('#agentPanel');
+  if (!a || a.available === false) { panel.style.display = 'none'; return; }
+  panel.style.display = '';
+  const ex = d.experiment, n = a.plan.length;
+  const pill = $('#agentPill');
+  const labels = { idle: ['idle', 'idle'], planning: ['planning', 'planning'], injecting: ['fault', 'injecting ' + ((a.current ?? 0) + 1) + '/' + n],
+                   done: ['ok', 'finished'], stopped: ['bad', 'stopped'], error: ['bad', 'failed'] };
+  const [cls, txt] = labels[a.phase] || ['idle', a.phase];
+  pill.className = 'pill ' + cls; pill.textContent = txt;
+  const now = $('#agentNow');
+  if (a.phase === 'planning') now.innerHTML = '<span class="dot"></span>The agent is <b>choosing which faults to inject</b> (reading the dependency map and past results)&hellip;';
+  else if (a.phase === 'injecting' && a.plan[a.current]) {
+    const r = a.plan[a.current];
+    now.innerHTML = `<span class="dot"></span>The agent is injecting <b>${aesc(r.fault)}</b> into <b>${aesc(r.target)}</b> &mdash; step ${a.current + 1} of ${n}: ${PHASES[ex.phase] || 'preparing'}. Nobody pressed a button.`;
+  } else if (a.phase === 'done' || a.phase === 'stopped') {
+    const s = a.summary || {};
+    now.innerHTML = `<span class="dot calm"></span>${a.phase === 'stopped' ? 'Stopped: ' + aesc(a.stop_reason || 'unknown reason') + '. ' : 'Finished. '}${s.run ?? 0} experiment(s) run by the agent, ${s.aborted ?? 0} auto-aborted by the safety layer, ${s.recovered ?? 0} recovered. Scores and findings below are updated.`;
+  } else if (a.phase === 'error') now.innerHTML = `<span class="dot calm"></span><span style="color:var(--bad)">The agent failed: ${aesc(a.error)}</span>`;
+  else now.innerHTML = 'Press <b>Start the agent</b>: it chooses which faults to inject, injects them one at a time and rolls each back, with nobody pressing a fault button.';
+  now.style.color = '';
+  let plan = '';
+  if (n) {
+    const by = a.planner === 'llm' ? 'AI planner (' + aesc(a.planner_model || '') + ')' : 'heuristic planner' + (a.planner_note ? ' &mdash; ' + aesc(a.planner_note).slice(0, 160) : '');
+    plan = `<div class="note" style="margin:0 0 6px">Plan by the ${by}. It can only choose from the validated candidate list.</div>
+      <table class="plan"><thead><tr><th>#</th><th>fault &rarr; service</th><th>why the agent chose it</th><th>hypothesis</th><th>status</th></tr></thead><tbody>` +
+      a.plan.map((r, i) => { const [c, t] = chipFor(r);
+        return `<tr class="${i === a.current && a.phase === 'injecting' ? 'cur' : ''}"><td>${r.n}</td><td><b>${aesc(r.fault)}</b> &rarr; ${aesc(r.target)}<div class="why">${r.duration_s} s</div></td><td class="why">${aesc(r.reason)}</td><td class="why">${aesc(r.hypothesis)}</td><td><span class="chip ${c}">${t}</span></td></tr>`; }).join('') + '</tbody></table>';
+  }
+  $('#agentPlan').innerHTML = plan;
+  const hh = t => new Date(t * 1000).toLocaleTimeString([], { hour12: false });
+  $('#agentLog').innerHTML = a.log.slice(-10).map(l => `<div><b>${hh(l.t)}</b>${aesc(l.msg)}</div>`).join('');
+  $('#agentStart').disabled = a.running || ex.running || d.kill_switch;
+  $('#agentMax').disabled = $('#agentLlm').disabled = a.running;
+}
+
 function render(d) {
   drawGraph(d);
+  renderAgent(d);
   const S = d.series, t0 = d.now - d.window_s, t1 = d.now, ex = d.experiment, ts = S.t;
   const fault = { start: ex.fault_start, end: ex.fault_end };
   const restarts = d.events.filter(e => e.kind === 'restart_count' && !e.initial).map(e => ({ t: e.t, service: e.service }));
@@ -270,10 +354,11 @@ function render(d) {
   // phase pill + banner
   const pill = $('#phase'); const killed = d.kill_switch && !ex.running;
   pill.className = 'pill ' + (killed ? 'killed' : ex.phase); pill.textContent = killed ? 'kill switch engaged' : (ex.phase === 'fault' ? 'FAULT ACTIVE' : ex.phase);
-  $('#exp').textContent = ex.running ? `${ex.fault} on ${ex.target}` : '';
+  $('#exp').textContent = ex.running ? `${ex.by_agent ? 'agent: ' : ''}${ex.fault} on ${ex.target}` : '';
   $('#rate').textContent = d.probe_rate_per_s;
-  document.querySelectorAll('button[data-fault]').forEach(b => b.disabled = ex.running || d.kill_switch);
-  $('#reset').disabled = ex.running;
+  const agentOn = !!(d.agent && d.agent.running);
+  document.querySelectorAll('button[data-fault]').forEach(b => b.disabled = ex.running || d.kill_switch || agentOn);
+  $('#reset').disabled = ex.running || agentOn;
 
   // stat cards
   const q = d.gauges.redis_queue_len, v = d.gauges.db_votes;
@@ -350,12 +435,14 @@ async function post(path, body) {
 }
 document.querySelectorAll('button[data-fault]').forEach(b => b.onclick = () => post('/api/inject', JSON.parse(b.dataset.fault)));
 $('#abort').onclick = () => post('/api/abort');
+$('#agentStart').onclick = () => post('/api/agent/start', { max: parseInt($('#agentMax').value, 10), use_llm: $('#agentLlm').checked });
 $('#reset').onclick = () => post('/api/reset');
 async function tick() {
   try {
     const r = await fetch('/api/metrics'); data = await r.json(); render(data);
-    if (wasRunning && !data.experiment.running) loadReport();          // a result was just written: refresh score, history, findings
-    wasRunning = !!data.experiment.running;
+    const expRun = !!data.experiment.running, agentRun = !!(data.agent && data.agent.running);
+    if ((wasRunning && !expRun) || (wasAgent && !agentRun)) loadReport();   // a result was just written: refresh score, history, findings
+    wasRunning = expRun; wasAgent = agentRun;
   }
   catch (e) { banner('dashboard server not reachable', true); }
 }

@@ -478,8 +478,23 @@ def dashboard(port: int = typer.Option(None, help="default: dashboard.port"),
     discovery.write_graph(graph_obj, RESULTS / "graph.json", graph_notes)     # keep results/graph.json in step with what is drawn
     graph_dump = graph_obj.model_dump()
     findings = report_mod.Live(RESULTS, live.store, lambda: graph_dump)
+    def build_agent(use_llm: bool, max_n: int, log, progress) -> SimpleNamespace:
+        """What `chaos agent` does, for the dashboard: plan, then hand the injecting agent the experiments."""
+        result, _ = make_plan(c, None, not use_llm, COMPOSE)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        exps = [e.model_copy(update={"thresholds": default_thresholds(c)}) for e in planner.to_experiments(result, stamp)][:max_n]
+        acfg = c.agent.model_copy(update={"max_experiments": max_n})
+        agent_ = InjectorAgent(live.orch, live.guard, live.health, acfg, c.experiment.baseline_s, c.experiment.recovery_timeout_s,
+                               log=log, progress=progress)
+
+        def save(run) -> None:                                     # same place and format as `chaos agent`
+            out = RESULTS / "agent-runs" / f"{stamp}.json"
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(run.model_dump_json(indent=2), encoding="utf-8")
+        return SimpleNamespace(plan=result, experiments=exps, agent=agent_, save=save)
+
     web = dashboard_mod.App(c, live.store, live.injector, kill, live.orch, lambda: table.data, graph_fn=lambda: graph_dump,
-                            report_fn=findings.get)
+                            report_fn=findings.get, agent_fn=build_agent)
     try:
         server = dashboard_mod.make_server(web, port)
     except OSError as e:
@@ -497,12 +512,13 @@ def dashboard(port: int = typer.Option(None, help="default: dashboard.port"),
         pass
     finally:
         engaged_here = False
-        if web.runner.snapshot()["running"]:                       # never leave a fault behind on exit
+        if web.runner.snapshot()["running"] or (web.agent and web.agent.snapshot()["running"]):    # never leave a fault behind on exit
             typer.echo("stopping the running experiment ...")
             kill.engage("dashboard shutdown")
             engaged_here = True
-            if web.runner.thread:
-                web.runner.thread.join(timeout=30)
+            for t in (web.runner.thread, web.agent.thread if web.agent else None):
+                if t:
+                    t.join(timeout=30)
         errors = live.injector.restore_all()
         if errors:
             typer.secho(f"restore problems on exit: {errors}", fg=typer.colors.RED, err=True)

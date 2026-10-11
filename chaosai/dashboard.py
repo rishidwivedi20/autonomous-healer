@@ -6,6 +6,7 @@
   GET  /api/metrics      one JSON snapshot: per-second series for both journeys, pipeline gauges,
                          container table, container events, experiment state, kill switch
   POST /api/inject       {target, fault, params?, duration_s?}  start one experiment in the background
+  POST /api/agent/start  {max?, use_llm?}  start the injecting agent: it plans, then injects the faults itself, one at a time
   POST /api/abort        kill switch: abort the running experiment, undo every fault
   POST /api/reset        undo everything, then clear the kill switch
 
@@ -28,7 +29,7 @@ from pathlib import Path
 
 from .config import Config
 from .injector import InjectionError
-from .models import Experiment, Thresholds
+from .models import Experiment, ExperimentResult, Thresholds
 from .observer import Store, events as query_events, gauge_series, percentile
 from .safety import SafetyViolation
 
@@ -97,6 +98,34 @@ class Runner:
         self.state: dict = {"running": False, "phase": "idle", "result": None, "error": None}
         orch.injector = TimedInjector(orch.injector, self)
 
+    @staticmethod
+    def result_dict(r: ExperimentResult) -> dict:
+        return {
+            "aborted": r.aborted, "abort_reason": r.abort_reason, "recovered": r.recovered,
+            "recovery_s": r.recovery_s, "recovery_probe_s": r.recovery_probe_s,
+            "recovery_pipeline_s": r.recovery_pipeline_s, "pipeline_assessed": r.pipeline_assessed, "restarts": r.restarts, "rollback_errors": r.rollback_errors,
+            "notes": r.notes, "missing_signals": r.missing_signals,
+            "baseline": {j: {"n": s.n, "error_rate": s.error_rate, "p95_ms": s.p95_ms} for j, s in r.baseline_by_journey.items()},
+            "during": {j: {"n": s.n, "error_rate": s.error_rate, "p95_ms": s.p95_ms} for j, s in r.during_by_journey.items()},
+        }
+
+    def begin_external(self, exp: Experiment) -> None:
+        """An experiment the injecting agent is about to run: show it exactly like one started with a button."""
+        with self.lock:
+            self.state = {"running": True, "phase": "baseline", "id": exp.id, "target": exp.target, "fault": exp.fault,
+                          "started_at": time.time(), "fault_start": None, "fault_end": None,
+                          "duration_s": exp.duration_s, "result": None, "error": None, "by_agent": True}
+
+    def end_external(self, result_file: str | None, error: str | None) -> None:
+        result = None
+        if result_file:
+            try:
+                result = self.result_dict(ExperimentResult.model_validate_json(Path(result_file).read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                result = None
+        with self.lock:
+            self.state.update(running=False, phase="idle", result=result, error=error)
+
     def _mark(self, phase: str) -> None:
         with self.lock:
             now = time.time()
@@ -131,20 +160,100 @@ class Runner:
         result, error = None, None
         try:
             r = self.orch.run(exp, baseline_s=self.cfg.dashboard.baseline_s, recovery_timeout_s=self.cfg.experiment.recovery_timeout_s)
-            result = {
-                "aborted": r.aborted, "abort_reason": r.abort_reason, "recovered": r.recovered,
-                "recovery_s": r.recovery_s, "recovery_probe_s": r.recovery_probe_s,
-                "recovery_pipeline_s": r.recovery_pipeline_s, "pipeline_assessed": r.pipeline_assessed, "restarts": r.restarts, "rollback_errors": r.rollback_errors,
-                "notes": r.notes, "missing_signals": r.missing_signals,
-                "baseline": {j: {"n": s.n, "error_rate": s.error_rate, "p95_ms": s.p95_ms} for j, s in r.baseline_by_journey.items()},
-                "during": {j: {"n": s.n, "error_rate": s.error_rate, "p95_ms": s.p95_ms} for j, s in r.during_by_journey.items()},
-            }
+            result = self.result_dict(r)
         except (SafetyViolation, InjectionError) as e:
             error = str(e)
         except Exception as e:                                   # never let the thread die silently
             error = f"{type(e).__name__}: {e}"
         with self.lock:
             self.state.update(running=False, phase="idle", result=result, error=error)
+
+
+class AgentRunner:
+    """Runs the injecting agent in a background thread and exposes what it is doing for the page: the plan (with the reason and
+    hypothesis for each experiment), which one is running now, how each ended, and the agent's own log. Nothing here decides
+    anything: planning, injection, safety and rollback are the same code `chaos agent` uses (`build_fn` assembles them)."""
+
+    LOG_LINES = 40
+
+    def __init__(self, runner: Runner, kill, build_fn):
+        self.runner, self.kill, self.build_fn = runner, kill, build_fn
+        self.lock = threading.Lock()
+        self.thread: threading.Thread | None = None
+        self.state: dict = self._idle()
+
+    @staticmethod
+    def _idle() -> dict:
+        return {"available": True, "running": False, "phase": "idle", "plan": [], "current": None, "log": [],
+                "planner": None, "planner_model": None, "planner_note": None, "stop_reason": None, "error": None,
+                "started_at": None, "ended_at": None}
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return json.loads(json.dumps(self.state))
+
+    def _log(self, msg: str) -> None:
+        with self.lock:
+            self.state["log"] = (self.state["log"] + [{"t": time.time(), "msg": msg}])[-self.LOG_LINES:]
+
+    def start(self, use_llm: bool, max_n: int) -> None:
+        if self.kill.engaged:
+            raise SafetyViolation("kill switch is engaged; press Reset first")
+        if self.runner.snapshot()["running"]:
+            raise SafetyViolation("an experiment is already running")
+        with self.lock:
+            if self.state["running"]:
+                raise SafetyViolation("the agent is already running")
+            self.state = {**self._idle(), "running": True, "phase": "planning", "started_at": time.time()}
+        self.thread = threading.Thread(target=self._run, args=(use_llm, max_n), daemon=True, name="injecting-agent")
+        self.thread.start()
+
+    def _update(self, **kw) -> None:
+        with self.lock:
+            self.state.update(kw)
+
+    def _progress(self, event: str, i: int, exp: Experiment, entry) -> None:
+        with self.lock:
+            row = self.state["plan"][i] if i < len(self.state["plan"]) else None
+            if event == "start":
+                self.state.update(phase="injecting", current=i)
+                if row:
+                    row["status"] = "running"
+            elif row and entry is not None:
+                row.update(status="skipped" if event == "skipped" else ("error" if event == "error" else ("aborted" if entry.aborted else "done")),
+                           aborted=entry.aborted, abort_reason=entry.abort_reason, recovered=entry.recovered,
+                           recovery_s=entry.recovery_s, detail=entry.detail[:300])
+        if event == "start":
+            self.runner.begin_external(exp)
+        else:
+            self.runner.end_external(entry.result_file if entry is not None and event == "done" else None,
+                                     entry.detail if entry is not None and event in ("skipped", "error") else None)
+
+    def _run(self, use_llm: bool, max_n: int) -> None:
+        try:
+            self._log("asking the planner which faults to inject" + (" (AI planner, heuristic fallback)" if use_llm else " (heuristic planner)"))
+            built = self.build_fn(use_llm, max_n, self._log, self._progress)
+            plan = built.plan
+            rows = [{"n": n, "id": e.id, "target": e.target, "fault": e.fault, "duration_s": e.duration_s,
+                     "reason": p.reason, "hypothesis": p.hypothesis, "status": "pending"}
+                    for n, (e, p) in enumerate(zip(built.experiments[:max_n], plan.experiments), 1)]
+            self._update(plan=rows, planner=plan.planner, planner_model=plan.model, planner_note=plan.fallback_reason)
+            self._log(f"plan ready: {len(rows)} experiment(s) by the {plan.planner} planner" + (f" ({plan.model})" if plan.model else ""))
+            run = built.agent.run(built.experiments, planner=plan.planner)
+            if built.save:
+                built.save(run)
+            done = [e for e in run.entries if e.status == "done"]
+            self._update(phase="stopped" if run.status == "stopped" else "done", stop_reason=run.stop_reason, current=None,
+                         summary={"run": len(done), "aborted": sum(e.aborted for e in done), "recovered": sum(bool(e.recovered) for e in done)})
+            self._log("agent finished" if run.status != "stopped" else f"agent stopped: {run.stop_reason}")
+        except Exception as e:                                       # never let the thread die silently
+            self._update(phase="error", error=f"{type(e).__name__}: {e}"[:400])
+            self._log(f"agent failed: {type(e).__name__}: {e}"[:300])
+        finally:
+            with self.lock:
+                self.state.update(running=False, ended_at=time.time())
+            if self.runner.snapshot()["running"]:                       # an experiment that was cut short must not look live
+                self.runner.end_external(None, "the agent stopped before this experiment finished")
 
 
 class ContainerTable(threading.Thread):
@@ -167,12 +276,13 @@ class ContainerTable(threading.Thread):
 
 
 class App:
-    def __init__(self, cfg: Config, store: Store, injector, kill, orch, containers_fn, graph_fn=None, report_fn=None):
+    def __init__(self, cfg: Config, store: Store, injector, kill, orch, containers_fn, graph_fn=None, report_fn=None, agent_fn=None):
         self.cfg, self.store, self.injector, self.kill = cfg, store, injector, kill
         self.runner = Runner(orch, cfg)
         self.containers_fn = containers_fn
         self.graph_fn = graph_fn
         self.report_fn = report_fn
+        self.agent = AgentRunner(self.runner, kill, agent_fn) if agent_fn else None
 
     def report(self) -> tuple[int, dict]:
         """The findings report (rule-based analysis of the stored experiments) for the score/history/findings panels."""
@@ -228,6 +338,7 @@ class App:
             "events": self._events(now - w, now),
             "containers": self.containers_fn(),
             "experiment": self.runner.snapshot(),
+            "agent": self.agent.snapshot() if self.agent else {"available": False},
             "kill_switch": self.kill.engaged,
             "probe_rate_per_s": self.cfg.dashboard.probe_rate_per_s,
         }
@@ -244,6 +355,8 @@ class App:
             return 400, {"error": f"{target!r} is not a managed service (label chaosai.managed=true); allowed: {', '.join(sorted(guard.managed_targets))}"}
         if self.kill.engaged:
             return 409, {"error": "kill switch is engaged; press Reset first"}
+        if self.agent and self.agent.snapshot()["running"]:
+            return 409, {"error": "the injecting agent is running; wait for it or press the kill switch"}
         params = {**self.cfg.faults[fault].params, **(body.get("params") or {})}
         duration = int(body.get("duration_s") or self.cfg.dashboard.duration_s)
         try:
@@ -251,6 +364,21 @@ class App:
         except SafetyViolation as e:
             return 409, {"error": str(e)}
         return 202, {"message": f"started {fault} on {target}", "id": exp_id}
+
+    def start_agent(self, body: dict) -> tuple[int, dict]:
+        if self.agent is None:
+            return 404, {"error": "this dashboard was started without the injecting agent"}
+        use_llm, max_n = body.get("use_llm", True), body.get("max", 2)
+        if not isinstance(use_llm, bool) or isinstance(max_n, bool) or not isinstance(max_n, int):
+            return 400, {"error": "use_llm must be true/false and max an integer"}
+        limit = max(1, self.cfg.agent.max_experiments)
+        if not 1 <= max_n <= limit:
+            return 400, {"error": f"max must be between 1 and {limit}"}
+        try:
+            self.agent.start(use_llm, max_n)
+        except SafetyViolation as e:
+            return 409, {"error": str(e)}
+        return 202, {"message": f"the injecting agent started: it will plan and inject up to {max_n} fault(s) by itself"}
 
     def abort(self) -> tuple[int, dict]:
         self.kill.engage("dashboard abort")
@@ -261,6 +389,8 @@ class App:
         return (500, {"error": "restore problems: " + "; ".join(errors)}) if errors else (200, {"message": "kill switch engaged; all faults undone"})
 
     def reset(self) -> tuple[int, dict]:
+        if self.agent and self.agent.snapshot()["running"]:
+            return 409, {"error": "the injecting agent is still running; use the kill switch to stop it"}
         if self.runner.snapshot()["running"]:
             return 409, {"error": "an experiment is still running; wait for it to stop"}
         try:
@@ -350,6 +480,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/api/inject":
             code, out = app.inject(body)
+        elif path == "/api/agent/start":
+            code, out = app.start_agent(body)
         elif path == "/api/abort":
             code, out = app.abort()
         elif path == "/api/reset":

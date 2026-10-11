@@ -56,10 +56,13 @@ class InjectorAgent:
     def __init__(self, orchestrator, guard: Guard, health_fn: Callable[[], list[str]], cfg: AgentCfg,
                  baseline_s: int, recovery_timeout_s: int,
                  clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep,
-                 log: Callable[[str], None] = lambda m: None):
+                 log: Callable[[str], None] = lambda m: None,
+                 progress: Callable[[str, int, Experiment, Optional["AgentEntry"]], None] = lambda *a: None):
+        """`progress(event, index, experiment, entry)` is called when an experiment starts ("start") and when it ends
+        ("done", "skipped" or "error"); the dashboard uses it to show what the agent is doing right now."""
         self.orch, self.guard, self.health_fn, self.cfg = orchestrator, guard, health_fn, cfg
         self.baseline_s, self.recovery_timeout_s = baseline_s, recovery_timeout_s
-        self.clock, self.sleep, self.log = clock, sleep, log
+        self.clock, self.sleep, self.log, self.progress = clock, sleep, log, progress
 
     # ------------------------------------------------------------ helpers
     def _pause(self, seconds: float) -> bool:
@@ -105,6 +108,7 @@ class InjectorAgent:
                     return stop(f"containers not healthy after {self.cfg.health_wait_s:g}s: {', '.join(bad)}", rest)
 
             self.log(f"[{i + 1}/{len(todo)}] injecting {exp.fault} into {exp.target} ({exp.duration_s}s)")
+            self.progress("start", i, exp, None)
             try:
                 result = self.orch.run(exp, baseline_s=self.baseline_s,
                                        recovery_timeout_s=self.recovery_timeout_s, dry_run=dry_run)
@@ -114,6 +118,7 @@ class InjectorAgent:
                 skips += 1
                 run.entries.append(AgentEntry(id=exp.id, target=exp.target, fault=exp.fault,
                                               status="skipped", detail=str(e)))
+                self.progress("skipped", i, exp, run.entries[-1])
                 self.log(f"    refused by safety guard: {e}")
                 if skips >= self.cfg.max_consecutive_skips:
                     return stop(f"{skips} experiments in a row refused by the safety guard (last: {e})", rest[1:])
@@ -121,6 +126,7 @@ class InjectorAgent:
             except InjectionError as e:
                 run.entries.append(AgentEntry(id=exp.id, target=exp.target, fault=exp.fault,
                                               status="error", detail=str(e)))
+                self.progress("error", i, exp, run.entries[-1])
                 return stop(f"injector error: {e}", rest[1:])
 
             skips = 0
@@ -131,6 +137,7 @@ class InjectorAgent:
                 rollback_errors=result.rollback_errors,
                 result_file=None if dry_run else str(Path(self.orch.results_dir) / f"{exp.id}.json"))
             run.entries.append(entry)
+            self.progress("planned" if dry_run else "done", i, exp, entry)
             if dry_run:
                 self.log(f"    {result.notes[0] if result.notes else 'planned'}")
                 continue
