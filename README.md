@@ -8,6 +8,8 @@ Inject failures into a small microservices app (Docker's example-voting-app), ob
 
 Prerequisite: Docker Desktop running (WSL2 backend), Python 3.11+.
 
+**Everything at once:** `.\start.cmd` starts the sandbox app, the live dashboard and opens the browser (the dashboard has a "Start the agent" button that plans and injects faults by itself); `.\stop.cmd` undoes any fault still in place and stops the dashboard (`-Sandbox` also stops the app containers). `.\start.ps1 -Fresh` rebuilds the sandbox from scratch first and `-NoBrowser` skips opening the page. The dashboard's output goes to `results\dashboard.log`.
+
 ```powershell
 git clone https://github.com/rishidwivedi20/autonomous-healer.git chaos-ai; cd chaos-ai
 python -m venv .venv; .\.venv\Scripts\pip install -r requirements.txt
