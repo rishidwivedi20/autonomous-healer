@@ -241,3 +241,37 @@ def test_cache_key_changes_with_inputs(graph, tmp_path):
     c2 = StubClient(reply((cands[0].id, 20)))
     llm_plan(graph, [hist("redis", "kill")], client=c2, cache_dir=tmp_path)    # new history -> new prompt -> new call
     assert len(c2.calls) == 1 and len(list(tmp_path.glob("plan-*.json"))) == 2
+
+
+# ---------------------------------------------------------------- a pool retries a bad answer on another member
+class PoolStub:
+    """Answers each new conversation from a script, like a pool whose members take turns; `members` is what marks it a pool."""
+    def __init__(self, *answers, members=3):
+        self.members, self.calls, self.answers = list(range(members)), 0, list(answers)
+        outer = self
+
+        class Messages:
+            def create(self, **kw):
+                outer.calls += 1
+                stop, text = outer.answers.pop(0)
+                return SimpleNamespace(stop_reason=stop, content=[SimpleNamespace(type="text", text=text)])
+        self.beta = SimpleNamespace(messages=Messages())
+
+
+def test_a_truncated_answer_is_retried_on_the_next_pool_member(graph):
+    cands = candidates(graph)
+    client = PoolStub(("max_tokens", "{"), ("end_turn", reply((cands[0].id, 30))))
+    plan = llm_plan(graph, [], n=6, client=client)
+    assert plan.planner == "llm" and client.calls == 2 and any("attempt 1 was unusable" in n and "truncated" in n for n in plan.notes)
+
+
+def test_every_pool_attempt_failing_falls_back_listing_each_reason(graph):
+    client = PoolStub(("max_tokens", "{"), ("end_turn", "not json"), ("end_turn", "{}"))
+    plan = make_plan(graph, [], n=6, client=client)
+    assert plan.planner == "heuristic" and client.calls == 3 and "truncated" in plan.fallback_reason and "not the expected JSON" in plan.fallback_reason
+
+
+def test_a_single_provider_client_is_not_retried(graph):
+    client = StubClient("{}", stop_reason="max_tokens")
+    plan = make_plan(graph, [], n=6, client=client)
+    assert plan.planner == "heuristic" and len(client.calls) == 1

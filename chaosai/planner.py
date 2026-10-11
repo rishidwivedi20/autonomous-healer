@@ -39,6 +39,9 @@ MAX_PER_TARGET = 2
 MAX_PER_FAULT = 3
 
 
+MAX_ATTEMPTS = 3                  # model answers tried per plan when the client is a pool
+
+
 class PlannerError(Exception):
     pass
 
@@ -313,8 +316,22 @@ def llm_plan(graph: Graph, history: list[dict], n: int = 6, client=None, cache_d
         if text is None:
             if client is None:
                 client = make_client(cfg.provider, cfg.members)
-            text = _call_model(client, user, cfg.llm_model, cfg.llm_effort)
-        experiments = _validate(text, cands, n)
+            # a pool starts every new conversation on its next member, so a truncated or invalid answer from one member
+            # is retried on another instead of dropping straight to the heuristic
+            attempts = min(MAX_ATTEMPTS, len(getattr(client, "members", None) or [])) or 1
+            problems = []
+            for _ in range(attempts):
+                try:
+                    text = _call_model(client, user, cfg.llm_model, cfg.llm_effort)
+                    experiments = _validate(text, cands, n)
+                    break
+                except PlannerError as e:
+                    problems.append(str(e))
+                    if len(problems) == attempts:
+                        raise PlannerError("; ".join(problems)) if attempts > 1 else e
+            notes += [f"attempt {i} was unusable: {m}" for i, m in enumerate(problems, 1)]
+        else:
+            experiments = _validate(text, cands, n)
     except PlannerError:
         raise
     except Exception as e:                                    # no credentials, network, API error, SDK change ...
