@@ -192,7 +192,7 @@ def fake_injector(monkeypatch, ids, status="completed", stop_reason=None):
 
 
 def test_pipeline_dry_run_plans_all_the_agents_and_changes_nothing(results):
-    r = runner.invoke(cli.app, ["pipeline", "--dry-run", "--offline", "--top", "2"])
+    r = runner.invoke(cli.app, ["pipeline", "--dry-run", "--offline", "--top", "2", "--validate-fix"])
     assert r.exit_code == 0, r.output
     assert "AGENT 1/3: INJECTING (plan)" in r.output and "AGENT 3/3: FIXING (plan)" in r.output and "nothing was changed" in r.output
     assert "DRY RUN: the agent would inject 2 fault(s)" in r.output and not (results / "fixes").exists()
@@ -213,7 +213,7 @@ def test_the_three_agents_run_in_order_and_the_report_includes_the_validated_fix
     inj = fake_injector(monkeypatch, [SPIKE_ID, KILL_ID])
     f = FakeFixer(results)
     stopped = fake_live(monkeypatch, f)
-    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--top", "2"])
+    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--validate-fix", "--top", "2"])
     assert r.exit_code == 0, r.output
     order = [r.output.index(m) for m in ("AGENT 1/3: INJECTING", "AGENT 2/3: FINDING", "AGENT 3/3: FIXING", "updating the report with the validated fix", "== SUMMARY ==")]
     assert order == sorted(order)
@@ -221,14 +221,14 @@ def test_the_three_agents_run_in_order_and_the_report_includes_the_validated_fix
     md = (results / "findings.md").read_text(encoding="utf-8")
     assert "## Fix validation: before and after" in md and "Run three worker replicas: measured improvement" in md
     assert "injecting: 2 experiment(s) run" in r.output and "finding:" in r.output and "resilience score" in r.output
-    assert "fixing:    scale-worker -> improved: resilience score 60.0 -> 96.0" in r.output and "findings.html" in r.output
+    assert "scale-worker measured -> improved: resilience score 60.0 -> 96.0" in r.output and "findings.html" in r.output
 
 
 def test_a_weakness_the_run_did_not_exercise_is_found_in_the_stored_history(results, monkeypatch):
     fake_injector(monkeypatch, [KILL_ID])                          # this run only killed the db: no backlog evidence in it
     f = FakeFixer(results)
     fake_live(monkeypatch, f)
-    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--top", "2"])
+    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--validate-fix", "--top", "2"])
     assert r.exit_code == 0 and "found in the stored history: this run's experiments did not exercise it" in r.output and f.calls
 
 
@@ -244,35 +244,35 @@ def test_keep_fix_is_passed_to_the_fixing_agent(results, monkeypatch):
     fake_injector(monkeypatch, [SPIKE_ID])
     f = FakeFixer(results)
     fake_live(monkeypatch, f)
-    assert runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--keep-fix"]).exit_code == 0 and f.calls[0][2] is True
+    assert runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--validate-fix", "--keep-fix"]).exit_code == 0 and f.calls[0][2] is True
 
 
 def test_a_stopped_injecting_agent_means_no_fix_and_a_failing_exit_code(results, monkeypatch):
     fake_injector(monkeypatch, [SPIKE_ID], status="stopped", stop_reason="kill switch engaged")
     f = FakeFixer(results)
     fake_live(monkeypatch, f)
-    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes"])
+    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--validate-fix"])
     assert r.exit_code == 1 and f.calls == [] and "stopped: kill switch engaged" in r.output and "AGENT 3/3" not in r.output
 
 
 def test_no_experiments_means_nothing_to_analyze(results, monkeypatch):
     fake_injector(monkeypatch, [])
-    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes"])
+    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--validate-fix"])
     assert r.exit_code == 1 and "nothing to analyze" in r.output
 
 
 def test_a_fixing_agent_that_cannot_run_does_not_undo_the_findings(results, monkeypatch):
     fake_injector(monkeypatch, [SPIKE_ID])
     fake_live(monkeypatch, FakeFixer(results, raises=fixer.FixError("docker command was not found")))
-    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes"])
+    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--validate-fix"])
     assert r.exit_code == 0 and "the fixing agent could not run: docker command was not found" in r.output
-    assert "fixing:    skipped" in r.output and (results / "findings.html").exists()
+    assert "change(s) recommended" in r.output and (results / "findings.html").exists()
 
 
 def test_a_fix_that_stopped_or_failed_to_revert_fails_the_pipeline(results, monkeypatch):
     fake_injector(monkeypatch, [SPIKE_ID])
     fake_live(monkeypatch, FakeFixer(results, improved_run(status="error", reverted=False, revert_errors=["boom"])))
-    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes"])
+    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--validate-fix"])
     assert r.exit_code == 1 and "NOT reverted: boom" in r.output
 
 
@@ -282,13 +282,13 @@ def test_when_no_finding_or_history_names_a_fix_the_pipeline_probes_the_catalogu
     fake_injector(monkeypatch, [KILL_ID])
     f = FakeFixer(results)
     fake_live(monkeypatch, f)
-    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--top", "2"])
+    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--validate-fix", "--top", "2"])
     assert r.exit_code == 0, r.output
     assert f.calls == [("scale-worker", "", None)]                    # asked to probe, with no weakness named
     assert "no finding names it, so the agent measures whether the problem exists; it changes nothing unless it does" in r.output
     assert "fixing: Run three worker replicas" in r.output
-    assert "addresses:" not in r.output.split("AGENT 3/3: FIXING")[1].split("FIX scale-worker")[0]
-    assert "fixing:    scale-worker ->" in r.output
+    assert "addresses:" not in r.output.split("fixing: Run three worker replicas")[1].split("FIX scale-worker")[0]
+    assert "scale-worker measured ->" in r.output
 
 
 def test_a_probe_that_does_not_reproduce_the_problem_is_reported_as_skipped_with_no_change(results, monkeypatch):
@@ -297,14 +297,36 @@ def test_a_probe_that_does_not_reproduce_the_problem_is_reported_as_skipped_with
     skipped = improved_run(status="skipped", reverted=False).model_copy(update={
         "detail": "the problem was not reproduced: redis queue peak was 2 (needs at least 20), so no change was made", "comparison": [], "claim": "", "after": None})
     fake_live(monkeypatch, FakeFixer(results, skipped))
-    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--top", "2"])
+    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--validate-fix", "--top", "2"])
     assert r.exit_code == 0 and "FIX scale-worker: SKIPPED" in r.output
-    assert "fixing:    scale-worker -> skipped: the problem was not reproduced" in r.output and "NOT reverted" not in r.output
+    assert "scale-worker measured -> skipped: the problem was not reproduced" in r.output and "NOT reverted" not in r.output
 
 
 def test_a_finding_that_names_a_fix_is_used_instead_of_probing(results, monkeypatch):
     fake_injector(monkeypatch, [SPIKE_ID])
     f = FakeFixer(results)
     fake_live(monkeypatch, f)
-    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--top", "2"])
+    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--validate-fix", "--top", "2"])
     assert f.calls[0][1].startswith("Single worker") and "no finding names it" not in r.output
+
+
+# ---------------------------------------------------------------- the fixing agent recommends by default and changes nothing
+def test_the_pipeline_recommends_changes_and_never_touches_the_sandbox_by_default(results, monkeypatch):
+    fake_injector(monkeypatch, [SPIKE_ID, KILL_ID])
+    f = FakeFixer(results)
+    started = fake_live(monkeypatch, f)
+    r = runner.invoke(cli.app, ["pipeline", "--offline", "--yes", "--top", "2"])
+    assert r.exit_code == 0, r.output
+    assert "AGENT 3/3: FIXING" in r.output and "recommended change(s)" in r.output and "nothing is changed" in r.output
+    assert f.calls == [] and "validating one vetted fix" not in r.output                  # the fixing agent was never asked to apply anything
+    assert "change(s) recommended, nothing changed" in r.output
+    rec = json.loads((results / "recommendations.json").read_text(encoding="utf-8"))
+    assert rec["changes_made"] is False and rec["items"] and (results / "recommendations.md").exists()
+    assert not (results / "active_fixes.json").exists()
+
+
+def test_chaos_recommend_ranks_changes_from_the_findings_without_running_anything(results):
+    r = runner.invoke(cli.app, ["recommend", "--offline"])
+    assert r.exit_code == 0, r.output
+    assert "recommended change(s), most important first (nothing is changed)" in r.output and "saved" in r.output
+    assert json.loads((results / "recommendations.json").read_text(encoding="utf-8"))["changes_made"] is False

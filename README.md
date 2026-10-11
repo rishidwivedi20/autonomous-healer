@@ -42,8 +42,9 @@ It strips every API key from the environment and ignores `.env` (`CHAOSAI_NO_DOT
 | `chaos plan [--top N] [--offline] [--dry-run]` | Ranks which experiments to run first (heuristic risk score, re-ranked by Claude when `ANTHROPIC_API_KEY` is set) |
 | `chaos agent [--top N] [--max N] [--offline] [--dry-run] [-y]` | **The injector agent**: plans, then introduces the faults one at a time through the safety guard |
 | `chaos autopilot [--top N] [--max N] [--offline] [--dry-run] [-y]` | **Hands-off end to end**: plan, inject with the agent, analyze, score, and write the findings report |
-| `chaos pipeline [--top N] [--max N] [--offline] [--no-fix] [--keep-fix] [--dry-run] [-y]` | **All three agents, hands-off**: INJECT faults, FIND the weaknesses (analysis, score, report), FIX the top one and prove it with the same experiment before and after; `--offline` needs no API key |
-| `chaos fix [--recipe ID] [--list] [--keep] [--revert] [--offline] [--dry-run] [-y]` | **The fixing agent** on its own: apply one vetted fix, run the same experiment before and after, compare, put the sandbox back; `--revert` undoes anything still applied |
+| `chaos pipeline [--top N] [--max N] [--offline] [--no-fix] [--validate-fix] [--keep-fix] [--dry-run] [-y]` | **All three agents, hands-off**: INJECT faults, FIND the weaknesses (analysis, score, report), RECOMMEND ranked changes (changes nothing); `--validate-fix` also applies one vetted fix and measures it before and after; `--offline` needs no API key |
+| `chaos recommend [--offline]` | **The fixing agent's main job**: rank recommended changes from the latest findings (`results/recommendations.{md,json}`); changes nothing and runs no experiment |
+| `chaos fix [--recipe ID] [--list] [--keep] [--revert] [--offline] [--dry-run] [-y]` | **Opt-in fix validation**: apply one vetted fix, run the same experiment before and after, compare, put the sandbox back; `--revert` undoes anything still applied |
 | `chaos report [--last N] [--offline]` | Write `results/findings.{md,html,json}` (resilience score, ranked weaknesses, cited fixes with verification re-runs) from the stored experiments |
 | `chaos discover [--live]` | Builds the dependency map from the compose file (and running containers with `--live`) |
 | `chaos baseline --seconds N` | Observes the healthy system and saves the baseline |
@@ -62,9 +63,11 @@ Faults: `kill`, `stop`, `pause`, `cpu-limit`, `memory-limit`, `network-delay`, `
 |---|---|---|---|
 | **Injecting** | plans the experiments, waits for a healthy system, injects one fault at a time through the safety guard, rolls back, cools down | `agent.py`, `planner.py`, `injector.py`, `safety.py` | heuristic risk ranking |
 | **Finding** | reads the stored measurements through read-only evidence tools; ranks weaknesses by severity with cited evidence, a fix and a verification re-run for each; computes the resilience score; writes `findings.{md,html,json}` | `finder.py`, `analyzer.py`, `rules.py`, `scoring.py`, `report.py` | deterministic rule-based analyzer |
-| **Fixing** | picks a vetted fix that matches a finding, measures the problem, applies the fix, re-runs the same experiment, compares, and reverts | `fixer.py` | the catalogue and the judging are plain code |
+| **Fixing** | **recommends** changes: ranks the analysis's proposed fixes by the severity they address, with evidence, the exact change, how to prove it, and any stored measurement. It changes nothing. Optionally (`chaos fix`, `chaos pipeline --validate-fix`) it proves one vetted fix by applying it, re-running the same experiment, comparing, and reverting | `recommend.py`, `fixer.py` | recommending is plain code; the catalogue and the judging are plain code |
 
-### The fixing agent, step by step
+### The fixing agent, step by step (opt-in validation)
+
+By default the fixing agent only **recommends** (`chaos recommend`, or step 3 of `chaos pipeline`): no experiment, no change to the sandbox. The steps below run only when you ask for them with `chaos fix` or `chaos pipeline --validate-fix`.
 
 1. **Choose.** It can only pick from `CATALOG` in `fixer.py`, a hard-coded list of reversible fixes (today: `scale-worker`, three worker replicas via `docker compose --scale`). A weakness selects a fix by naming the service and a matching word; an LLM (or a person) only ever supplies an id, never a command. `chaos fix --list` shows the catalogue.
 2. **Before.** It runs the fix's verification experiment (for `scale-worker`: a traffic spike on vote at 15 votes/s for 20 s, converted to a multiplier from the probe's own rate) through the normal orchestrator, safety guard and rollback, and measures it.

@@ -9,12 +9,19 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import typer
 import yaml
+
+for _stream in (sys.stdout, sys.stderr):           # model-written text can hold characters a Windows console (cp1252) cannot print
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 from . import config as config_mod
 from .envfile import load_env, mask
@@ -24,7 +31,9 @@ from . import discovery, planner
 from . import report as report_mod
 from .evidence import Evidence
 from .finder import FindingAgent, FindingError
+from .analysis import Analysis
 from . import fixer as fixer_mod
+from . import recommend as recommend_mod
 from .agent import InjectorAgent
 from .injector import InjectionError
 from .models import Experiment, Graph, Thresholds
@@ -704,7 +713,7 @@ def fix(recipe: str = typer.Option(None, "--recipe", "-r", help="which vetted fi
         dry_run: bool = typer.Option(False, help="show the plan; change nothing"),
         yes: bool = typer.Option(False, "--yes", "-y", help="do not ask for confirmation"),
         compose: Path = typer.Option(COMPOSE)):
-    """The fixing agent: apply one vetted fix, run the same experiment before and after, compare, and put things back."""
+    """Prove one vetted fix: apply it, run the same experiment before and after, compare, and put things back. (Recommending changes changes nothing: `chaos recommend`.)"""
     c = cfg()
     if list_fixes:
         for r in fixer_mod.CATALOG.values():
@@ -767,22 +776,61 @@ def print_plan_of_fix(run: fixer_mod.FixRun) -> None:
     typer.echo("  nothing was changed")
 
 
+def print_recommendations(rec: recommend_mod.Recommendations) -> None:
+    if not rec.items:
+        typer.echo("no changes recommended")
+        return
+    typer.echo(f"{len(rec.items)} recommended change(s), most important first (nothing is changed):")
+    for r in rec.items:
+        typer.echo(f"  {r.rank}. [{r.severity.upper()}] {r.title}   (addresses: {', '.join(r.addresses) or 'n/a'})")
+        typer.echo(f"       {r.rationale}")
+        if r.can_be_validated_by:
+            typer.echo(f"       can be measured: chaos fix --recipe {r.can_be_validated_by}" + (f"   | {r.measured}" if r.measured else ""))
+
+
+@app.command()
+def recommend(offline: bool = typer.Option(False, help="ignore the saved analysis and use the rule-based analysis of every stored experiment (no LLM)"),
+              compose: Path = typer.Option(COMPOSE)):
+    """The fixing agent's main job: rank recommended changes from the latest findings. Changes nothing and runs no experiment."""
+    c = cfg()
+    saved = RESULTS / "analysis.json"
+    analysis = None
+    if saved.exists() and not offline:
+        try:
+            analysis = Analysis.model_validate_json(saved.read_text(encoding="utf-8"))
+            typer.echo(f"using the latest findings ({saved}; analysis by {analysis.generated_by})")
+        except ValueError:
+            analysis = None
+    if analysis is None:
+        graph = load_graph(compose)
+        try:
+            analysis = FindingAgent(c.analyzer, RESULTS, graph, use_llm=False).analyze(None)
+        except FindingError as e:
+            fail(str(e), 1)
+        typer.echo("no saved findings to use: using the rule-based analysis of every stored experiment")
+    rec = recommend_mod.recommend(analysis, RESULTS)
+    print_recommendations(rec)
+    paths = recommend_mod.write(rec, RESULTS)
+    typer.echo(f"saved {paths['md']}")
+
+
 @app.command()
 def pipeline(top: int = typer.Option(None, "--top", "-n", help="experiments to plan (default: planner.top)"),
              max_experiments: int = typer.Option(None, "--max", help="cap on experiments actually run (default: agent.max_experiments)"),
              offline: bool = typer.Option(False, help="no LLM anywhere: heuristic planner, rule-based analyzer (works with no API key)"),
              dry_run: bool = typer.Option(False, help="plan everything and change nothing"),
-             no_fix: bool = typer.Option(False, "--no-fix", help="stop after the finding agent"),
-             keep_fix: bool = typer.Option(False, "--keep-fix", help="keep the fix if it is measured to help (default: put the sandbox back)"),
+             no_fix: bool = typer.Option(False, "--no-fix", help="stop after the finding agent (skip the fixing agent)"),
+             validate_fix: bool = typer.Option(False, "--validate-fix", help="also apply one vetted fix and measure it before and after (changes the sandbox temporarily; default: only recommend)"),
+             keep_fix: bool = typer.Option(False, "--keep-fix", help="with --validate-fix: keep the fix if it is measured to help (default: put the sandbox back)"),
              yes: bool = typer.Option(False, "--yes", "-y", help="do not ask for confirmation"),
              compose: Path = typer.Option(COMPOSE)):
-    """All three agents, hands-off: INJECT faults, FIND the weaknesses, FIX the top one and prove it with the same experiment."""
+    """All three agents, hands-off: INJECT faults, FIND the weaknesses, RECOMMEND the changes (optionally prove one with --validate-fix)."""
     c = cfg()
     graph = load_graph(compose)
     if dry_run:
         typer.secho("== AGENT 1/3: INJECTING (plan) ==", bold=True)
         agent(top=top, max_experiments=max_experiments, offline=offline, dry_run=True, yes=True, compose=compose)
-        if not no_fix:
+        if not no_fix and validate_fix:
             typer.secho("\n== AGENT 3/3: FIXING (plan) ==", bold=True)
             r = next(iter(fixer_mod.CATALOG.values()))
             typer.echo("(the fix is chosen from the findings once the experiments have run; this is the first one in the catalogue)")
@@ -796,7 +844,8 @@ def pipeline(top: int = typer.Option(None, "--top", "-n", help="experiments to p
     n_run = min(len(exps), acfg.max_experiments)
     typer.echo(f"\nPIPELINE: the injecting agent will inject {n_run} fault(s) one at a time into containers labeled chaosai.managed=true on this machine; "
                "the finding agent will analyze and score them; "
-               + ("" if no_fix else "the fixing agent will then apply one vetted fix, re-run the same experiment, compare, and put things back. ")
+               + ("" if no_fix else "the fixing agent will then recommend changes (it changes nothing). " if not validate_fix
+                  else "the fixing agent will then recommend changes, then apply one vetted fix, re-run the same experiment, compare, and put things back. ")
                + "Kill switch: Ctrl+C or `chaos abort`.")
     if not yes and not typer.confirm("Continue?"):
         fail("cancelled; nothing injected", 1)
@@ -811,8 +860,15 @@ def pipeline(top: int = typer.Option(None, "--top", "-n", help="experiments to p
     found = make_report(c, done, offline, compose)
 
     fix_run = None
+    recs = None
     if not no_fix and run.status != "stopped":
         typer.secho("\n== AGENT 3/3: FIXING ==", bold=True)
+        recs = recommend_mod.recommend(found.analysis, RESULTS)
+        print_recommendations(recs)
+        recommend_mod.write(recs, RESULTS)
+        typer.echo(f"saved {RESULTS / 'recommendations.md'}")
+    if validate_fix and recs is not None:
+        typer.secho("\nvalidating one vetted fix in the sandbox (it is put back afterwards) ...", bold=True)
         picks, note = fixer_mod.FixingAgent.select(found.analysis), ""
         if not picks:                                           # this run may not have exercised a weakness the catalogue can fix
             try:
@@ -845,7 +901,10 @@ def pipeline(top: int = typer.Option(None, "--top", "-n", help="experiments to p
     sc = found.report["score"]
     typer.echo(f"finding:   {len(found.analysis.weaknesses)} weakness(es), resilience score "
                + ("n/a" if sc["score"] is None else f"{sc['score']:.1f}/100 ({sc['band']})") + f", analysis by {found.analysis.generated_by}")
-    typer.echo("fixing:    " + ("skipped" if fix_run is None else f"{fix_run.recipe_id} -> {fix_run.status}: {fix_run.claim or fix_run.detail}"))
+    if fix_run is not None:
+        typer.echo(f"fixing:    {len(recs.items)} change(s) recommended; {fix_run.recipe_id} measured -> {fix_run.status}: {fix_run.claim or fix_run.detail}")
+    else:
+        typer.echo("fixing:    " + ("skipped" if recs is None else f"{len(recs.items)} change(s) recommended, nothing changed ({RESULTS / 'recommendations.md'})"))
     typer.echo(f"report:    {found.paths['html']}")
     if run.status == "stopped" or (fix_run and (fix_run.status in ("stopped", "error") or fix_run.revert_errors)):
         raise typer.Exit(1)

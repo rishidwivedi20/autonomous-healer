@@ -422,24 +422,36 @@ class Acceptance:
         c(g, "the report is generated from stored results only, with evidence, severity and a verification for each fix", report)
 
         def pipeline():
-            before_fix = set((self.results / "fixes").glob("*.json")) if (self.results / "fixes").exists() else set()
             rc, out = self.chaos("pipeline", "--offline", "--yes", "--top", "2", "--max", "2", timeout=1500)
             self.must(rc == 0, f"exit {rc}: {out[-400:]}")
             for marker in ("AGENT 1/3: INJECTING", "AGENT 2/3: FINDING", "AGENT 3/3: FIXING", "== SUMMARY =="):
                 self.must(marker in out, f"missing {marker!r}")
+            rec = self.load(self.results / "recommendations.json")
+            self.must(rec["changes_made"] is False and rec["items"], "the fixing agent recommended nothing")
+            self.must(not (self.results / "active_fixes.json").exists(), "a fix is recorded as applied, but the fixing agent only recommends")
+            n_workers = sum(1 for n in self.containers() if "-worker-" in n)
+            self.must(n_workers == 1, f"{n_workers} worker containers: the sandbox was changed")
+            problem = self.settle()
+            self.must(not problem, problem)
+            return f"all three agents ran; {len(rec['items'])} change(s) recommended, nothing changed"[:300]
+        c(g, "all three agents run end to end (inject, find, recommend) and the sandbox is untouched", pipeline)
+
+        def validate_fix():
+            before_fix = set((self.results / "fixes").glob("*.json")) if (self.results / "fixes").exists() else set()
+            rc, out = self.chaos("fix", "--recipe", "scale-worker", "--yes", timeout=1500)
+            self.must(rc == 0, f"exit {rc}: {out[-400:]}")
             new = [p for p in (self.results / "fixes").glob("*.json") if p not in before_fix]
             self.must(len(new) == 1, f"{len(new)} fix records written")
             fix = self.load(new[0])
             self.must(fix["status"] in ("improved", "inconclusive", "worse", "skipped"), f"fix status {fix['status']}: {fix['detail']}")
             self.must(not fix["revert_errors"] and (fix["reverted"] or fix["status"] == "skipped"), f"not reverted: {fix['revert_errors']}")
-            self.must("Fix validation" in (self.results / "findings.md").read_text(encoding="utf-8"), "the report has no fix validation section")
             self.must(not (self.results / "active_fixes.json").exists(), "a fix is still recorded as applied")
             n_workers = sum(1 for n in self.containers() if "-worker-" in n)
             self.must(n_workers == 1, f"{n_workers} worker containers after the fix was reverted")
             problem = self.settle()
             self.must(not problem, problem)
-            return f"all three agents ran; the fix was {fix['status']}: {fix['claim'] or fix['detail']}"[:300]
-        c(g, "all three agents run end to end (inject, find, fix) and the sandbox is restored", pipeline)
+            return f"the opt-in validation measured the fix as {fix['status']}: {fix['claim'] or fix['detail']}"[:300]
+        c(g, "the opt-in fix validation measures a fix before and after and puts the sandbox back", validate_fix)
 
         def dashboard():
             base = f"http://127.0.0.1:{PORT}"
