@@ -204,14 +204,17 @@ SUBMIT_TOOL = {
 class Recorder:
     """Wraps the evidence tools and remembers which numbers each call returned (see Seen)."""
 
-    def __init__(self, ev):
+    def __init__(self, ev, shrink=None):
         self.ev = ev
         self.seen = Seen(ev.ids())
         self.calls = 0
+        self.shrink = shrink                 # optional: make a large output small enough to send; only what is sent counts as seen
 
     def call(self, name: str, args: dict | None) -> dict:
         self.calls += 1
         out = self.ev.call(name, args)
+        if "error" not in out and self.shrink:
+            out = self.shrink(out)
         if "error" not in out:
             self.seen.record(args, out)
         return out

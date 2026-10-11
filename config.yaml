@@ -51,6 +51,7 @@ planner:
     - {provider: gemini, model: gemini-3-flash-preview}              # GEMINI_API_KEY; the free tier allows ~20 requests per model per day
     - {provider: gemini, model: gemini-3.5-flash-lite}
     - {provider: openrouter, model: "openai/gpt-oss-120b"}           # OPENROUTER_API_KEY; paid but cheap (the :free id returned 404 when tested)
+    - {provider: groq, model: "openai/gpt-oss-120b"}                 # GROQ_API_KEY; free plan with per-minute and per-day caps
     - {provider: mistral, model: mistral-small-latest}               # MISTRAL_API_KEY (needs an active plan)
 
 analyzer:                    # `chaos analyze`: the tool-using agent that explains the stored results
@@ -60,6 +61,8 @@ analyzer:                    # `chaos analyze`: the tool-using agent that explai
   llm_effort: medium         # low | medium | high | xhigh | max (Anthropic only)
   max_turns: 16              # tool-call rounds before the agent is cut off (enough for up to 3 experiments)
   turns_per_experiment: 4    # extra rounds for each experiment beyond three; models that make one call per turn need them (cap 80)
+  batch_size: 1              # experiments analysed per conversation; each batch starts on the next pool member, so no single request nears a free tier's per-minute token cap (0 = one conversation for all)
+  max_tool_output_chars: 2500  # a longer tool result is trimmed to its summary (the per-second rows are dropped)
   max_rejects: 3             # answers rejected for citing numbers the tools never returned, before giving up
   members: *llm_members
 

@@ -62,6 +62,9 @@ def make_member_client(m: PoolMember):
     if m.provider == "mistral":
         from .mistral import MistralClient
         return MistralClient(key=key)
+    if m.provider == "groq":
+        from .groq import GroqClient
+        return GroqClient(key=key)
     if m.provider == "openrouter":
         from .openrouter import OpenRouterClient
         return OpenRouterClient(key=key)

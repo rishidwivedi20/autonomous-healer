@@ -41,7 +41,7 @@ def test_the_repo_config_yaml_loads_and_every_model_matches_its_provider():
     c = config.load(Path(__file__).parent.parent / "config.yaml")
     for section in (c.planner, c.analyzer):
         if section.provider == "pool":
-            assert section.members and all(m.provider in ("anthropic", "gemini", "mistral", "openrouter") for m in section.members)
+            assert section.members and all(m.provider in ("anthropic", "gemini", "mistral", "openrouter", "groq") for m in section.members)
         else:
             assert (section.provider == "gemini") == section.llm_model.startswith("gemini")
 

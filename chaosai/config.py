@@ -84,10 +84,10 @@ DEFAULT_FAULTS: dict[str, FaultCfg] = {
 }
 
 
-Provider = Literal["anthropic", "gemini", "mistral", "openrouter", "pool"]
-MemberProvider = Literal["anthropic", "gemini", "mistral", "openrouter"]
+Provider = Literal["anthropic", "gemini", "mistral", "openrouter", "groq", "pool"]
+MemberProvider = Literal["anthropic", "gemini", "mistral", "openrouter", "groq"]
 _MISTRAL_PREFIXES = ("mistral", "ministral", "magistral", "codestral", "devstral", "pixtral", "open-mistral", "open-mixtral")
-KEY_ENV_PREFIXES = ("ANTHROPIC_", "GEMINI_", "MISTRAL_", "OPENROUTER_")
+KEY_ENV_PREFIXES = ("ANTHROPIC_", "GEMINI_", "MISTRAL_", "OPENROUTER_", "GROQ_")
 
 
 def _vendor_of(model: str) -> str | None:
@@ -104,6 +104,8 @@ def _vendor_of(model: str) -> str | None:
 def _check_model(provider: str, model: str) -> None:
     """A model name from another vendor would only fail later with a 404, so say so at load time."""
     vendor = _vendor_of(model)
+    if provider == "groq" and vendor == "openrouter":      # Groq also names models vendor/model (openai/gpt-oss-120b)
+        return
     if vendor is not None and vendor != provider:
         raise ValueError(f"provider is {provider} but llm_model is {model!r}, which is a {vendor} model; "
                          f"set a {provider} model (see `chaos llm-check --provider {provider} --models`) or switch the provider to {vendor}")
@@ -152,7 +154,7 @@ class PlannerCfg(_Base):
     max_per_target: int = Field(2, ge=1)
     max_per_fault: int = Field(3, ge=1)
     use_llm: bool = True
-    provider: Provider = "anthropic"      # anthropic | gemini | mistral | openrouter (one key each), or pool (see `members`)
+    provider: Provider = "anthropic"      # anthropic | gemini | mistral | openrouter | groq (one key each), or pool (see `members`)
     llm_model: str = "claude-opus-5-5"    # ignored with provider: pool
     llm_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"     # Anthropic only
     llm_pool: int = Field(14, ge=1)       # how many top candidates the LLM may choose from
@@ -166,12 +168,14 @@ class PlannerCfg(_Base):
 
 class AnalyzerCfg(_Base):
     use_llm: bool = True                 # needs a key for `provider`; falls back to the rule-based analyzer if unavailable
-    provider: Provider = "anthropic"     # anthropic | gemini | mistral | openrouter (one key each), or pool (see `members`)
+    provider: Provider = "anthropic"     # anthropic | gemini | mistral | openrouter | groq (one key each), or pool (see `members`)
     llm_model: str = "claude-opus-5-5"   # ignored with provider: pool
     llm_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"     # Anthropic only
     max_turns: int = Field(16, ge=2)     # tool-call rounds before the agent is cut off (enough for up to 3 experiments)
     turns_per_experiment: int = Field(4, ge=0)    # extra rounds for each experiment beyond three; one-call-per-turn models need them
     max_rejects: int = Field(3, ge=0)    # answers rejected for citing numbers the tools never returned, before giving up
+    batch_size: int = Field(0, ge=0)     # 0 = one conversation for all experiments; N = analyse N at a time, each in a fresh small conversation
+    max_tool_output_chars: int = Field(24000, ge=1000)   # a longer tool result is trimmed (bulky per-second rows dropped, summary kept)
     members: list[PoolMember] = Field(default_factory=list)                      # for provider: pool
 
     @model_validator(mode="after")

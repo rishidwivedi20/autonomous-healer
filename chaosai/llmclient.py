@@ -1,5 +1,5 @@
 """Which LLM client the planner and analyzer use. Both only call client.beta.messages.create(...), so every adapter
-(Gemini, Mistral, OpenRouter) and the pool of them is a drop-in for the Anthropic SDK client."""
+(Gemini, Mistral, OpenRouter, Groq) and the pool of them is a drop-in for the Anthropic SDK client."""
 from __future__ import annotations
 
 
@@ -13,6 +13,9 @@ def make_client(provider: str, members=None):
     if provider == "mistral":
         from .mistral import MistralClient
         return MistralClient()
+    if provider == "groq":
+        from .groq import GroqClient
+        return GroqClient()
     if provider == "openrouter":
         from .openrouter import OpenRouterClient
         return OpenRouterClient()

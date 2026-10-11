@@ -65,6 +65,7 @@ class ChatCompletionsClient:
     BASE_URL = ""
     KEY_ENV = ""
     NORMALIZE_IDS = False                        # the API only accepts 9-character alphanumeric tool-call ids
+    MAX_WAIT_S = MAX_BACKOFF_S                   # a 429 asking for a longer wait than this fails at once (the pool moves on)
     REPLAY_FIELDS: tuple = ()                    # extra assistant-message fields to send back unchanged (e.g. reasoning)
 
     def __init__(self, key: Optional[str] = None, transport: Optional[httpx.BaseTransport] = None,
@@ -192,10 +193,10 @@ class ChatCompletionsClient:
                 if final:
                     raise final
             wait = self._retry_after(r)
-            if r.status_code == 429 and wait is not None and wait > MAX_BACKOFF_S:
+            if r.status_code == 429 and wait is not None and wait > self.MAX_WAIT_S:
                 raise ChatCompletionsError(f"rate limit exceeded; the API asks for a wait of about {wait / 60:.0f} min ({self._error_text(r)})", 429, wait)
             if r.status_code in RETRY_STATUSES and attempt < self.max_retries:
-                self._sleep(min(wait if wait is not None else 2.0 ** (attempt + 1), MAX_BACKOFF_S))
+                self._sleep(min(wait if wait is not None else 2.0 ** (attempt + 1), max(MAX_BACKOFF_S, self.MAX_WAIT_S)))
                 continue
             raise ChatCompletionsError(f"HTTP {r.status_code}: {self._error_text(r)}", r.status_code, wait)
         raise ChatCompletionsError("retries exhausted")                    # unreachable; keeps type checkers calm

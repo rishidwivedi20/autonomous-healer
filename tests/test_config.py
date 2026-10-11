@@ -29,11 +29,12 @@ def test_defaults_equal_the_hard_coded_values_the_code_used_before():
 
 def test_repo_config_yaml_matches_the_defaults():
     """config.yaml documents the defaults; if it drifts from them, behaviour silently changes. The one deliberate
-    exception is which LLM provider, model and pool members the planner and analyzer use: that is the team's deployment choice."""
+    exception is which LLM provider, model and pool members the planner and analyzer use, and how the analyzer batches its work: that is the team's deployment choice."""
     def dump(path):
         d = config.load(path).model_dump()
         for section in ("planner", "analyzer"):
             d[section].pop("provider"), d[section].pop("llm_model"), d[section].pop("members")
+        d["analyzer"].pop("batch_size"), d["analyzer"].pop("max_tool_output_chars")      # sized for the free tiers the team uses
         return d
     assert dump(REPO_CONFIG) == dump(Path("does-not-exist.yaml"))
 

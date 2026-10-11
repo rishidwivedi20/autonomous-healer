@@ -169,9 +169,9 @@ def make_plan(c: config_mod.Config, top: int | None, offline: bool, compose: Pat
 # ------------------------------------------------------------------ llm-check
 @app.command("llm-check")
 def llm_check(send: bool = typer.Option(True, help="--no-send only checks that a key is configured"),
-              provider: str = typer.Option(None, help="anthropic | gemini | mistral | openrouter | pool (default: analyzer.provider)"),
-              models: bool = typer.Option(False, "--models", help="gemini / mistral / openrouter: list the models this key can use"),
-              model: str = typer.Option(None, "--model", help="gemini / mistral / openrouter: model to test (default: analyzer.llm_model when it matches the provider)"),
+              provider: str = typer.Option(None, help="anthropic | gemini | mistral | openrouter | groq | pool (default: analyzer.provider)"),
+              models: bool = typer.Option(False, "--models", help="gemini / mistral / openrouter / groq: list the models this key can use"),
+              model: str = typer.Option(None, "--model", help="gemini / mistral / openrouter / groq: model to test (default: analyzer.llm_model when it matches the provider)"),
               match: str = typer.Option(None, "--match", help="with --models: only names containing this text (OpenRouter lists hundreds)")):
     """Check the LLM key: is one configured, and does one tiny request work? (Costs a fraction of a cent or nothing.)"""
     c = cfg()
@@ -182,10 +182,12 @@ def llm_check(send: bool = typer.Option(True, help="--no-send only checks that a
         return llm_check_mistral(c, send, models, model, match)
     if provider == "openrouter":
         return llm_check_openrouter(c, send, models, model, match)
+    if provider == "groq":
+        return llm_check_groq(c, send, models, model, match)
     if provider == "pool":
         return llm_check_pool(c, send)
     if provider != "anthropic":
-        fail(f"unknown provider {provider!r}; use anthropic, gemini, mistral, openrouter or pool")
+        fail(f"unknown provider {provider!r}; use anthropic, gemini, mistral, openrouter, groq or pool")
     key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
     if not key:
         fail("no key found. Set ANTHROPIC_API_KEY (see README: 'Getting an Anthropic API key') or put it in .env", 1)
@@ -265,6 +267,33 @@ def llm_check_mistral(c: config_mod.Config, send: bool, list_models: bool, model
         if "0 requests per minute" in str(e):               # waiting cannot help; the message already says what to do
             hint = ""
         fail(f"Mistral error: {e}{hint}", 1)
+    text = next((b.text for b in resp.content if getattr(b, "type", None) == "text"), "")
+    typer.echo(f"OK: {model} answered {text.strip()!r}; stop_reason={resp.stop_reason}; "
+               f"tokens in={resp.usage.input_tokens} out={resp.usage.output_tokens}")
+
+
+def llm_check_groq(c: config_mod.Config, send: bool, list_models: bool, model: str | None = None, match: str | None = None) -> None:
+    from .groq import GroqClient, GroqError, api_key
+    key = api_key()
+    if not key:
+        fail("no Groq key found. Create one at https://console.groq.com/keys and put GROQ_API_KEY=... in .env", 1)
+    typer.echo(f"key found: {mask(key)}  (provider in config: planner={c.planner.provider}, analyzer={c.analyzer.provider})")
+    if not send and not list_models:
+        return
+    try:
+        client = GroqClient()
+        if list_models:
+            names = [n for n in client.list_models() if not match or match.lower() in n.lower()]
+            typer.echo(f"{len(names)} model(s) this key can call:\n  " + "\n  ".join(names))
+        if not send:
+            return
+        model = model or (c.analyzer.llm_model if c.analyzer.provider == "groq" else "openai/gpt-oss-120b")
+        resp = client.messages.create(model=model, max_tokens=256, messages=[{"role": "user", "content": "Reply with the single word: ok"}])
+    except GroqError as e:
+        hint = {400: "  (check the model name: try --models)", 401: "  (the key was rejected: check it is copied completely and not revoked)",
+                403: "  (the key is valid but this model is not allowed for it)", 404: "  (no such model: try --models)",
+                429: "  (rate limited; the free plan has per-minute and per-day request and token caps per model)"}.get(e.status or 0, "")
+        fail(f"Groq error: {e}{hint}", 1)
     text = next((b.text for b in resp.content if getattr(b, "type", None) == "text"), "")
     typer.echo(f"OK: {model} answered {text.strip()!r}; stop_reason={resp.stop_reason}; "
                f"tokens in={resp.usage.input_tokens} out={resp.usage.output_tokens}")
